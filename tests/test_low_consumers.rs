@@ -555,3 +555,79 @@ async fn test_invalid_consumer_position() {
         Err(KafkaError::MetadataFetch(RDKafkaErrorCode::UnknownGroup))
     );
 }
+
+// `partition_position` reads one partition's fetch position without asking for
+// the assignment first, so unlike `position` it does not need a group (#360).
+#[tokio::test]
+async fn test_partition_position_without_a_group() {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_server().as_str())
+        .create()
+        .unwrap();
+    assert_eq!(
+        consumer.partition_position("nonexistent_topic", 0),
+        Ok(Offset::Invalid)
+    );
+}
+
+// The position and the cached watermarks are invalid before the first fetch,
+// then the position is one past the last consumed message and the watermarks
+// are the ones the fetch response carried.
+#[tokio::test]
+async fn test_partition_position_and_get_watermark_offsets() {
+    let _r = env_logger::try_init();
+
+    let topic_name = rand_test_topic("test_partition_position_and_get_watermark_offsets");
+    populate_topic(&topic_name, 5, &value_fn, &key_fn, Some(0), None).await;
+    let consumer = create_base_consumer(&rand_test_group(), None);
+
+    assert_eq!(
+        consumer.partition_position(&topic_name, 0),
+        Ok(Offset::Invalid)
+    );
+    let (low, high) = consumer.get_watermark_offsets(&topic_name, 0).unwrap();
+    assert_eq!((low, high), (-1001, -1001));
+
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(&topic_name, 0);
+    consumer.assign(&tpl).unwrap();
+    for message in consumer.iter().take(3) {
+        message.unwrap();
+    }
+
+    assert_eq!(
+        consumer.partition_position(&topic_name, 0),
+        Ok(Offset::Offset(3))
+    );
+    // The fetch response carries both: the log start of a fresh topic and
+    // the high watermark one past the fifth message.
+    assert_eq!(consumer.get_watermark_offsets(&topic_name, 0), Ok((0, 5)));
+    assert_eq!(
+        consumer.get_watermark_offsets("\0", 0),
+        Err(KafkaError::Nul(std::ffi::CString::new("\0").unwrap_err()))
+    );
+}
+
+// `member_id` is `None` without a group, empty before the join, and the
+// coordinator's id once a partition has been assigned.
+#[tokio::test]
+async fn test_member_id() {
+    let _r = env_logger::try_init();
+
+    let groupless: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_server().as_str())
+        .create()
+        .unwrap();
+    assert_eq!(groupless.member_id(), None);
+
+    let topic_name = rand_test_topic("test_member_id");
+    populate_topic(&topic_name, 1, &value_fn, &key_fn, Some(0), None).await;
+    let consumer = create_base_consumer(&rand_test_group(), None);
+    assert_eq!(consumer.member_id(), Some(String::new()));
+
+    consumer.subscribe(&[topic_name.as_str()]).unwrap();
+    consumer.iter().next().unwrap().unwrap();
+    let member_id = consumer.member_id().unwrap();
+    assert!(!member_id.is_empty());
+    assert_eq!(consumer.member_id(), Some(member_id));
+}

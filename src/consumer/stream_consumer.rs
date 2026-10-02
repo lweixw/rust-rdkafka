@@ -512,6 +512,18 @@ where
         self.base.position()
     }
 
+    fn partition_position(&self, topic: &str, partition: i32) -> KafkaResult<Offset> {
+        self.base.partition_position(topic, partition)
+    }
+
+    fn get_watermark_offsets(&self, topic: &str, partition: i32) -> KafkaResult<(i64, i64)> {
+        self.base.get_watermark_offsets(topic, partition)
+    }
+
+    fn member_id(&self) -> Option<String> {
+        self.base.member_id()
+    }
+
     fn fetch_metadata<T>(&self, topic: Option<&str>, timeout: T) -> KafkaResult<Metadata>
     where
         T: Into<Timeout>,

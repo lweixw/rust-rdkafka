@@ -5,7 +5,7 @@
 //! [`AdminClient`]: struct.AdminClient.html
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -380,6 +380,54 @@ impl<C: ClientContext> AdminClient<C> {
                 self.client.native_ptr(),
                 native_configs.as_c_array(),
                 native_configs.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            );
+        }
+        Ok(rx)
+    }
+
+    /// Describes the specified consumer groups.
+    ///
+    /// Describing multiple groups at once is not atomic: the description of
+    /// some groups may succeed while others fail, so check each result.
+    /// At least one group id is required; a group the coordinator does not
+    /// know is described with no members rather than with an error; and a
+    /// request that times out reports the timeout per group.
+    pub fn describe_consumer_groups<'a, I>(
+        &self,
+        group_ids: I,
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<ConsumerGroupDescriptionResult>>>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        match self.describe_consumer_groups_inner(group_ids, opts) {
+            Ok(rx) => Either::Left(DescribeConsumerGroupsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn describe_consumer_groups_inner<'a, I>(
+        &self,
+        group_ids: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let group_ids = group_ids
+            .into_iter()
+            .map(CString::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut group_id_ptrs: Vec<*const c_char> = group_ids.iter().map(|g| g.as_ptr()).collect();
+        let mut err_buf = ErrBuf::new();
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        unsafe {
+            rdsys::rd_kafka_DescribeConsumerGroups(
+                self.client.native_ptr(),
+                group_id_ptrs.as_mut_ptr(),
+                group_id_ptrs.len(),
                 native_opts.ptr(),
                 self.queue.ptr(),
             );
@@ -1350,4 +1398,87 @@ impl Future for AlterConfigsFuture {
         }
         Poll::Ready(Ok(out))
     }
+}
+
+//
+// Describe consumer groups handling
+//
+
+/// The result of an individual DescribeConsumerGroups operation.
+pub type ConsumerGroupDescriptionResult =
+    Result<ConsumerGroupDescription, (String, RDKafkaErrorCode)>;
+
+/// The description of a consumer group, as the group's coordinator reports it.
+#[derive(Debug, PartialEq)]
+pub struct ConsumerGroupDescription {
+    /// The group id.
+    pub group_id: String,
+    /// The group's current members.
+    pub members: Vec<MemberDescription>,
+}
+
+/// One member of a described consumer group.
+#[derive(Debug, PartialEq)]
+pub struct MemberDescription {
+    /// The member id the coordinator assigned to the consumer.
+    pub consumer_id: String,
+    /// The member's host, as the coordinator reports it.
+    pub host: String,
+    /// The partitions currently assigned to the member.
+    pub assignment: TopicPartitionList,
+}
+
+struct DescribeConsumerGroupsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for DescribeConsumerGroupsFuture {
+    type Output = KafkaResult<Vec<ConsumerGroupDescriptionResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_DescribeConsumerGroups_result(event.ptr()) };
+        if res.is_null() {
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "describe consumer groups request received response of incorrect type ({})",
+                typ
+            ))));
+        }
+        let mut n = 0;
+        let groups = unsafe { rdsys::rd_kafka_DescribeConsumerGroups_result_groups(res, &mut n) };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let group = unsafe { *groups.add(i) };
+            out.push(unsafe { build_consumer_group_description(group) });
+        }
+        Poll::Ready(Ok(out))
+    }
+}
+
+unsafe fn build_consumer_group_description(
+    group: *const rdsys::rd_kafka_ConsumerGroupDescription_t,
+) -> ConsumerGroupDescriptionResult {
+    let group_id = cstr_to_owned(rdsys::rd_kafka_ConsumerGroupDescription_group_id(group));
+    let error = rdsys::rd_kafka_ConsumerGroupDescription_error(group);
+    if !error.is_null() {
+        return Err((group_id, rdsys::rd_kafka_error_code(error).into()));
+    }
+    let n = rdsys::rd_kafka_ConsumerGroupDescription_member_count(group);
+    let mut members = Vec::with_capacity(n);
+    for i in 0..n {
+        let member = rdsys::rd_kafka_ConsumerGroupDescription_member(group, i);
+        let partitions = rdsys::rd_kafka_MemberAssignment_partitions(
+            rdsys::rd_kafka_MemberDescription_assignment(member),
+        );
+        members.push(MemberDescription {
+            consumer_id: cstr_to_owned(rdsys::rd_kafka_MemberDescription_consumer_id(member)),
+            host: cstr_to_owned(rdsys::rd_kafka_MemberDescription_host(member)),
+            assignment: TopicPartitionList::from_ptr(rdsys::rd_kafka_topic_partition_list_copy(
+                partitions,
+            )),
+        });
+    }
+    Ok(ConsumerGroupDescription { group_id, members })
 }

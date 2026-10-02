@@ -372,6 +372,38 @@ where
     /// Retrieve current positions (offsets) for topics and partitions.
     fn position(&self) -> KafkaResult<TopicPartitionList>;
 
+    /// Retrieves the current position (offset) of one partition.
+    ///
+    /// The position is the offset librdkafka will fetch next: one past the
+    /// last message or control record consumed. It is [`Offset::Invalid`]
+    /// until one has been consumed, and again after a seek or once fetching
+    /// stops for the partition. The read is one partition lookup
+    /// (`rd_kafka_position` over a one-element list), where
+    /// [`Consumer::position`] first asks librdkafka's main thread for the
+    /// whole assignment (`rd_kafka_assignment`) and reads every partition in
+    /// it. A partition librdkafka does not know reads as [`Offset::Invalid`]:
+    /// the lookup creates a local, desired handle for it rather than failing.
+    fn partition_position(&self, topic: &str, partition: i32) -> KafkaResult<Offset>;
+
+    /// Returns the last known low (oldest) and high (newest) offsets of a
+    /// partition from librdkafka's cache, without a request to the broker.
+    ///
+    /// Both are updated from every fetch response for the partition (against
+    /// a leader older than Fetch v5, the low watermark comes from the periodic
+    /// offset query under `statistics.interval.ms`). Either is `RD_KAFKA_OFFSET_INVALID`
+    /// (-1001) until librdkafka has learned it, and for a partition it does
+    /// not know, for which the lookup creates a local, desired handle.
+    /// [`Consumer::fetch_watermarks`] queries the broker instead.
+    fn get_watermark_offsets(&self, topic: &str, partition: i32) -> KafkaResult<(i64, i64)>;
+
+    /// Returns this consumer's group member id.
+    ///
+    /// `None` for a consumer without a `group.id`; an empty string before the
+    /// consumer has joined the group. librdkafka serves the read from its main
+    /// thread (`rd_kafka_memberid` is an `rd_kafka_op_req2` on the group's
+    /// queue, waited for without a timeout), so it is not a hot-path call.
+    fn member_id(&self) -> Option<String>;
+
     /// Returns the metadata information for the specified topic, or for all
     /// topics in the cluster if no topic is specified.
     fn fetch_metadata<T>(&self, topic: Option<&str>, timeout: T) -> KafkaResult<Metadata>

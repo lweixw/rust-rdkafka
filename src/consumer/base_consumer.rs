@@ -708,6 +708,51 @@ where
         }
     }
 
+    fn partition_position(&self, topic: &str, partition: i32) -> KafkaResult<Offset> {
+        let mut tpl = TopicPartitionList::with_capacity(1);
+        tpl.add_partition(topic, partition);
+        let error = unsafe { rdsys::rd_kafka_position(self.client.native_ptr(), tpl.ptr()) };
+        if error.is_error() {
+            return Err(KafkaError::MetadataFetch(error.into()));
+        }
+        let elem = tpl
+            .find_partition(topic, partition)
+            .expect("the list holds the one partition it was built with");
+        elem.error()?;
+        Ok(elem.offset())
+    }
+
+    fn get_watermark_offsets(&self, topic: &str, partition: i32) -> KafkaResult<(i64, i64)> {
+        let topic_c = CString::new(topic)?;
+        let mut low = -1;
+        let mut high = -1;
+        let error = unsafe {
+            rdsys::rd_kafka_get_watermark_offsets(
+                self.client.native_ptr(),
+                topic_c.as_ptr(),
+                partition,
+                &mut low,
+                &mut high,
+            )
+        };
+        if error.is_error() {
+            Err(KafkaError::MetadataFetch(error.into()))
+        } else {
+            Ok((low, high))
+        }
+    }
+
+    fn member_id(&self) -> Option<String> {
+        let native = self.client.native_ptr();
+        let raw = unsafe { rdsys::rd_kafka_memberid(native) };
+        if raw.is_null() {
+            return None;
+        }
+        let member_id = unsafe { cstr_to_owned(raw) };
+        unsafe { rdsys::rd_kafka_mem_free(native, raw as *mut c_void) };
+        Some(member_id)
+    }
+
     fn fetch_metadata<T: Into<Timeout>>(
         &self,
         topic: Option<&str>,
