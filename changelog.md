@@ -4,7 +4,12 @@ See also the [rdkafka-sys changelog](rdkafka-sys/changelog.md).
 
 ## Unreleased
 
-None
+* Add `Consumer::partition_position`, `Consumer::get_watermark_offsets` and
+  `Consumer::member_id`, wrapping `rd_kafka_position` over one partition,
+  `rd_kafka_get_watermark_offsets` and `rd_kafka_memberid`.
+* Add `AdminClient::describe_consumer_groups`, wrapping
+  `rd_kafka_DescribeConsumerGroups` with the group id, member ids, hosts and
+  assignments of the described groups.
 
 ## 0.39.0 (2026-01-25)
 

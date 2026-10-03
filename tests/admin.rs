@@ -665,6 +665,28 @@ async fn test_event_errors() {
         res,
         Err(KafkaError::AdminOp(RDKafkaErrorCode::OperationTimedOut))
     );
+
+    // A describe needs at least one group id.
+    let res = admin_client
+        .describe_consumer_groups(std::iter::empty::<&str>(), &opts)
+        .await;
+    assert_eq!(
+        res,
+        Err(KafkaError::AdminOp(RDKafkaErrorCode::InvalidArgument))
+    );
+
+    // A describe that times out reports the timeout per group, not as a
+    // failure of the whole request.
+    let res = admin_client
+        .describe_consumer_groups(["some_group"], &opts)
+        .await;
+    assert_eq!(
+        res,
+        Ok(vec![Err((
+            "some_group".to_string(),
+            RDKafkaErrorCode::OperationTimedOut
+        ))])
+    );
 }
 
 // `test_incorrect_replication_factors_are_ignored_when_creating_topics`

@@ -4,7 +4,9 @@ use crate::utils::consumer;
 use crate::utils::containers::KafkaContext;
 use crate::utils::logging::init_test_logger;
 use crate::utils::rand::{rand_test_group, rand_test_topic};
-use rdkafka::admin::{AdminOptions, GroupResult, NewTopic, TopicReplication};
+use rdkafka::admin::{
+    AdminOptions, ConsumerGroupDescription, GroupResult, NewTopic, TopicReplication,
+};
 use rdkafka::consumer::Consumer;
 use rdkafka_sys::RDKafkaErrorCode;
 
@@ -254,5 +256,133 @@ pub async fn test_consumer_group_action_mixed_results() {
                 RDKafkaErrorCode::GroupIdNotFound
             ))
         ])
+    );
+}
+
+/// Two members of one group, each holding one partition of a two-partition
+/// topic, are described back with their ids, hosts and assignments; an unknown
+/// group in the same request is described with no members.
+#[tokio::test]
+async fn test_describe_consumer_groups() {
+    init_test_logger();
+
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+    let admin_client = utils::admin::create_admin_client(&kafka_context.bootstrap_servers)
+        .await
+        .expect("could not create admin client");
+    let topic_name = rand_test_topic("test_describe_consumer_groups");
+    let group_name = rand_test_group();
+    let unknown_group_name = rand_test_group();
+    admin_client
+        .create_topics(
+            &[NewTopic::new(&topic_name, 2, TopicReplication::Fixed(1))],
+            &AdminOptions::default(),
+        )
+        .await
+        .expect("could not create topic");
+
+    // One address family, so both members connect from the same host.
+    let create_member = || {
+        consumer::create_base_consumer(
+            &kafka_context.bootstrap_servers,
+            &group_name,
+            Some(&[("broker.address.family", "v4")]),
+        )
+        .expect("could not create base consumer")
+    };
+    let members = [create_member(), create_member()];
+    for member in &members {
+        member.subscribe(&[topic_name.as_str()]).unwrap();
+    }
+    // Poll until the rebalance has handed each member one partition.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        for member in &members {
+            let _ = member.poll(Duration::from_millis(100));
+        }
+        let assigned = members
+            .iter()
+            .map(|m| m.assignment().unwrap().count())
+            .collect::<Vec<_>>();
+        if assigned == [1, 1] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "members never reached one partition each: {assigned:?}"
+        );
+    }
+
+    let res = admin_client
+        .describe_consumer_groups(
+            [group_name.as_str(), unknown_group_name.as_str()],
+            &AdminOptions::default(),
+        )
+        .await
+        .expect("describe failed");
+    assert_eq!(res.len(), 2);
+
+    let described = res[0].as_ref().expect("the live group is described");
+    assert_eq!(described.group_id, group_name);
+    let mut described_members = described
+        .members
+        .iter()
+        .map(|m| {
+            let partitions = m
+                .assignment
+                .elements()
+                .iter()
+                .map(|e| (e.topic().to_owned(), e.partition()))
+                .collect::<Vec<_>>();
+            (m.consumer_id.clone(), m.host.clone(), partitions)
+        })
+        .collect::<Vec<_>>();
+    described_members.sort();
+    let mut expected = members
+        .iter()
+        .map(|m| {
+            let partitions = m
+                .assignment()
+                .unwrap()
+                .elements()
+                .iter()
+                .map(|e| (e.topic().to_owned(), e.partition()))
+                .collect::<Vec<_>>();
+            (m.member_id().unwrap(), partitions)
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(
+        described_members
+            .iter()
+            .map(|(id, _, partitions)| (id.clone(), partitions.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    // Both members run in this process, so the coordinator reports one host
+    // for them, and it is not a member id.
+    let hosts = described_members
+        .iter()
+        .map(|(_, host, _)| host.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !hosts[0].is_empty(),
+        "the coordinator reports each member's host"
+    );
+    assert_eq!(hosts[0], hosts[1]);
+    assert!(described_members
+        .iter()
+        .all(|(id, _, _)| !hosts.contains(&id.as_str())));
+
+    // The coordinator describes a group it does not know with no members and
+    // no error.
+    assert_eq!(
+        res[1],
+        Ok(ConsumerGroupDescription {
+            group_id: unknown_group_name,
+            members: vec![],
+        })
     );
 }

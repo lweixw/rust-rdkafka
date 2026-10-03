@@ -887,3 +887,143 @@ async fn test_consumer_rebalance_callbacks() {
     );
     assert_eq!(assign2.partitions[0].0, topic_name);
 }
+
+/// Polls until `count` messages have been delivered or a minute has passed,
+/// skipping the transient error events a fresh broker surfaces in-band
+/// (`NotCoordinator`, `BrokerTransportFailure`) and naming the last one if the
+/// deadline passes.
+fn consume_messages<C: ConsumerContext>(consumer: &BaseConsumer<C>, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut delivered = 0;
+    let mut last_error = None;
+    while delivered < count {
+        assert!(
+            Instant::now() < deadline,
+            "{delivered} of {count} messages delivered; last error: {last_error:?}"
+        );
+        match consumer.poll(Duration::from_secs(1)) {
+            Some(Ok(_)) => delivered += 1,
+            Some(Err(error)) => last_error = Some(error),
+            None => {}
+        }
+    }
+}
+
+// `partition_position` reads one partition's fetch position without asking for
+// the assignment first, so unlike `position` it does not need a group (#360).
+#[tokio::test]
+async fn test_partition_position_without_a_group() {
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &kafka_context.bootstrap_servers)
+        .create()
+        .unwrap();
+    assert_eq!(
+        consumer.partition_position("nonexistent_topic", 0),
+        Ok(Offset::Invalid)
+    );
+}
+
+// The position and the cached watermarks are invalid before the first fetch,
+// then the position is one past the last consumed message and the watermarks
+// are the ones the fetch response carried.
+#[tokio::test]
+async fn test_partition_position_and_get_watermark_offsets() {
+    init_test_logger();
+
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+    let topic_name = rand_test_topic("test_partition_position_and_get_watermark_offsets");
+    let admin_client = admin::create_admin_client(&kafka_context.bootstrap_servers)
+        .await
+        .expect("could not create admin client");
+    admin_client
+        .create_topics(
+            &admin::new_topic_vec(&topic_name, Some(1)),
+            &AdminOptions::default(),
+        )
+        .await
+        .expect("could not create topic");
+    let producer = producer::future_producer::create_producer(&kafka_context.bootstrap_servers)
+        .await
+        .expect("could not create future producer");
+    produce_messages_to_partition(&producer, &topic_name, 5, 0).await;
+    let consumer = utils::consumer::create_base_consumer(
+        &kafka_context.bootstrap_servers,
+        &rand_test_group(),
+        None,
+    )
+    .expect("could not create base consumer");
+
+    assert_eq!(
+        consumer.partition_position(&topic_name, 0),
+        Ok(Offset::Invalid)
+    );
+    assert_eq!(
+        consumer.get_watermark_offsets(&topic_name, 0),
+        Ok((-1001, -1001))
+    );
+
+    consumer.subscribe(&[topic_name.as_str()]).unwrap();
+    consume_messages(&consumer, 3);
+
+    assert_eq!(
+        consumer.partition_position(&topic_name, 0),
+        Ok(Offset::Offset(3))
+    );
+    // The fetch response carries both: the log start of a fresh topic and
+    // the high watermark one past the fifth message.
+    assert_eq!(consumer.get_watermark_offsets(&topic_name, 0), Ok((0, 5)));
+    assert_eq!(
+        consumer.get_watermark_offsets("\0", 0),
+        Err(KafkaError::Nul(std::ffi::CString::new("\0").unwrap_err()))
+    );
+}
+
+// `member_id` is `None` without a group, empty before the join, and the
+// coordinator's id once a partition has been assigned.
+#[tokio::test]
+async fn test_member_id() {
+    init_test_logger();
+
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+    let groupless: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &kafka_context.bootstrap_servers)
+        .create()
+        .unwrap();
+    assert_eq!(groupless.member_id(), None);
+
+    let topic_name = rand_test_topic("test_member_id");
+    let admin_client = admin::create_admin_client(&kafka_context.bootstrap_servers)
+        .await
+        .expect("could not create admin client");
+    admin_client
+        .create_topics(
+            &admin::new_topic_vec(&topic_name, Some(1)),
+            &AdminOptions::default(),
+        )
+        .await
+        .expect("could not create topic");
+    let producer = producer::future_producer::create_producer(&kafka_context.bootstrap_servers)
+        .await
+        .expect("could not create future producer");
+    produce_messages_to_partition(&producer, &topic_name, 1, 0).await;
+    let consumer = utils::consumer::create_base_consumer(
+        &kafka_context.bootstrap_servers,
+        &rand_test_group(),
+        None,
+    )
+    .expect("could not create base consumer");
+    assert_eq!(consumer.member_id(), Some(String::new()));
+
+    consumer.subscribe(&[topic_name.as_str()]).unwrap();
+    consume_messages(&consumer, 1);
+    let member_id = consumer.member_id().unwrap();
+    assert!(!member_id.is_empty());
+    assert_eq!(consumer.member_id(), Some(member_id));
+}
