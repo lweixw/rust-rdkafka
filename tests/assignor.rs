@@ -133,7 +133,7 @@ impl PartitionAssignor for RoundRobinAssignor {
         self.tag.clone()
     }
 
-    fn assign(&self, _member_id: &str, metadata: &Metadata, mut task: AssignmentTask) {
+    fn assign(&self, _member_id: &str, metadata: &Metadata, task: AssignmentTask) {
         // The metadata is valid during the call only: copy the partition
         // counts before the task leaves the thread.
         let partition_counts: BTreeMap<String, i32> = metadata
@@ -170,7 +170,13 @@ impl PartitionAssignor for RoundRobinAssignor {
             call.instance_ids
                 .push(member.group_instance_id().map(str::to_owned));
             call.rack_ids.push(member.rack_id().map(str::to_owned));
-            call.subscriptions.push(member.subscription());
+            call.subscriptions.push(
+                member
+                    .subscription()
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            );
             call.owned.push(owned);
             call.userdata.push(member.userdata().to_vec());
         }
@@ -200,11 +206,11 @@ impl PartitionAssignor for RoundRobinAssignor {
 
         let finish = move |mut task: AssignmentTask| {
             for (rank, (_, idx)) in members.iter().enumerate() {
-                let mut member = task.member(*idx);
-                let mut userdata: Vec<u8> = member.userdata().iter().rev().copied().collect();
+                let mut userdata: Vec<u8> =
+                    task.member(*idx).userdata().iter().rev().copied().collect();
                 userdata.extend_from_slice(USERDATA_SUFFIX);
-                member.set_assignment(&per_member[rank]);
-                member.set_userdata(&userdata);
+                task.set_assignment(*idx, &per_member[rank]);
+                task.set_userdata(*idx, &userdata);
             }
             task.complete();
         };
@@ -801,7 +807,7 @@ async fn test_assignor_failed_rounds_rejoin() {
                         task.member(1);
                     }));
                     assert!(out_of_range.is_err(), "member(1) of one member must panic");
-                    task.member(0).set_assignment(&list);
+                    task.set_assignment(0, &list);
                     task.complete();
                 }
             }

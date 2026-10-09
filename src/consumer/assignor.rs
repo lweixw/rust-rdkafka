@@ -25,10 +25,10 @@
 //! the assignment is pending and every member's SyncGroup waits for it, so the
 //! task must complete within `session.timeout.ms` less `heartbeat.interval.ms`
 //! of the JoinGroup response, or the library gives the assignment up and
-//! rejoins. A panic in a callback is caught at the FFI
-//! boundary and logged: a panicking `subscription_userdata` sends no userdata,
-//! a panicking `assign` fails the assignment (the group rejoins), and a
-//! panicking `on_assignment` leaves the assignment applied.
+//! rejoins. A panic in a callback is caught at the FFI boundary and logged: a
+//! panicking `subscription_userdata` sends no userdata, a panicking `assign`
+//! fails the assignment (the group rejoins) unless the task was already handed
+//! off, and a panicking `on_assignment` leaves the assignment applied.
 //!
 //! Under [`AssignorProtocol::Cooperative`] the post-assignment adjustment the
 //! built-in assignors rely on is not applied: the assignor itself withholds a
@@ -64,6 +64,10 @@ use crate::topic_partition_list::TopicPartitionList;
 use crate::util::cstr_to_owned;
 
 /// The rebalance protocol an application assignor speaks.
+///
+/// A consumer that has joined reports its protocol as a
+/// [`RebalanceProtocol`](crate::consumer::RebalanceProtocol), whose `None`
+/// (not yet joined) has no place in a registration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignorProtocol {
     /// Every member gives up all its partitions at the start of a rebalance
@@ -74,7 +78,8 @@ pub enum AssignorProtocol {
     Cooperative,
 }
 
-/// This consumer's group identity at the time of an assignment.
+/// This consumer's group identity at the time of an assignment (what Java
+/// passes to `onAssignment` as its `ConsumerGroupMetadata`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssignedGroup {
     /// The group id.
@@ -163,16 +168,20 @@ pub trait PartitionAssignor: Send + Sync {
 ///
 /// The task owns the group's members for as long as it lives. Read them with
 /// [`member`](AssignmentTask::member), set each member's assignment and
-/// userdata, then [`complete`](AssignmentTask::complete) the task; the members'
-/// assignments are then sent to the group. The task may be moved to another
-/// thread and completed there. A task that is dropped without being completed
-/// fails the assignment and the group rejoins, as does [`fail`](AssignmentTask::fail).
+/// userdata with [`set_assignment`](AssignmentTask::set_assignment) and
+/// [`set_userdata`](AssignmentTask::set_userdata), then
+/// [`complete`](AssignmentTask::complete) the task; the members' assignments
+/// are then sent to the group, and a member left unset gets no partitions and
+/// no userdata. The task may be moved to another thread and completed there.
+/// A task that is dropped without being completed fails the assignment and
+/// the group rejoins, as does [`fail`](AssignmentTask::fail).
 ///
 /// A task completed after the group rejoined, unsubscribed, picked another
 /// assignor or gave the assignment up, or after the consumer was dropped, is
 /// discarded. A task
 /// that is neither completed nor dropped (`mem::forget`) leaks its members,
 /// and the library gives the assignment up when its budget runs out.
+#[must_use = "dropping the task fails the assignment"]
 pub struct AssignmentTask {
     pending: *mut RDKafkaAssignorPending,
     members: *mut RDKafkaAssignorMember,
@@ -191,17 +200,43 @@ impl AssignmentTask {
 
     /// The member at `idx`, which must be less than
     /// [`member_count`](AssignmentTask::member_count).
-    pub fn member(&mut self, idx: usize) -> GroupMember<'_> {
+    pub fn member(&self, idx: usize) -> GroupMember<'_> {
+        GroupMember {
+            ptr: self.member_ptr(idx),
+            _task: PhantomData,
+        }
+    }
+
+    /// Sets the partitions assigned to the member at `idx`; topic and
+    /// partition are copied, nothing else.
+    pub fn set_assignment(&mut self, idx: usize, assignment: &TopicPartitionList) {
+        let member = self.member_ptr(idx);
+        unsafe { rdsys::rd_kafka_assignor_member_set_assignment(member, assignment.ptr()) }
+    }
+
+    /// Sets the userdata assigned to the member at `idx`; empty means none.
+    ///
+    /// The protocol carries at most `i32::MAX` bytes.
+    pub fn set_userdata(&mut self, idx: usize, userdata: &[u8]) {
+        assert_userdata_fits(userdata);
+        let member = self.member_ptr(idx);
+        unsafe {
+            rdsys::rd_kafka_assignor_member_set_userdata(
+                member,
+                userdata.as_ptr() as *const c_void,
+                userdata.len(),
+            )
+        }
+    }
+
+    fn member_ptr(&self, idx: usize) -> *mut RDKafkaAssignorMember {
         assert!(
             idx < self.member_count,
             "member index {} out of range for {} members",
             idx,
             self.member_count
         );
-        GroupMember {
-            ptr: unsafe { rdsys::rd_kafka_assignor_member_at(self.members, idx) },
-            _task: PhantomData,
-        }
+        unsafe { rdsys::rd_kafka_assignor_member_at(self.members, idx) }
     }
 
     /// Sends the members' assignments and userdata to the group.
@@ -249,10 +284,10 @@ impl Drop for AssignmentTask {
 }
 
 /// One member of the group, as seen by the leader's
-/// [`PartitionAssignor::assign`].
+/// [`PartitionAssignor::assign`]. Reads only; the task sets.
 pub struct GroupMember<'a> {
-    ptr: *mut RDKafkaAssignorMember,
-    _task: PhantomData<&'a mut AssignmentTask>,
+    ptr: *const RDKafkaAssignorMember,
+    _task: PhantomData<&'a AssignmentTask>,
 }
 
 impl GroupMember<'_> {
@@ -272,7 +307,7 @@ impl GroupMember<'_> {
     }
 
     /// The topics the member subscribed to.
-    pub fn subscription(&self) -> Vec<String> {
+    pub fn subscription(&self) -> Vec<&str> {
         let list = unsafe { rdsys::rd_kafka_assignor_member_subscription(self.ptr) };
         if list.is_null() {
             return Vec::new();
@@ -280,7 +315,7 @@ impl GroupMember<'_> {
         let elems = unsafe { slice::from_raw_parts((*list).elems, (*list).cnt as usize) };
         elems
             .iter()
-            .map(|e| unsafe { cstr_to_owned(e.topic) })
+            .map(|e| unsafe { str_from_ptr(e.topic) })
             .collect()
     }
 
@@ -304,26 +339,6 @@ impl GroupMember<'_> {
             &[]
         } else {
             unsafe { slice::from_raw_parts(data as *const u8, size) }
-        }
-    }
-
-    /// Sets the partitions assigned to the member; topic and partition are
-    /// copied, nothing else.
-    pub fn set_assignment(&mut self, assignment: &TopicPartitionList) {
-        unsafe { rdsys::rd_kafka_assignor_member_set_assignment(self.ptr, assignment.ptr()) }
-    }
-
-    /// Sets the userdata assigned to the member; empty means none.
-    ///
-    /// The protocol carries at most `i32::MAX` bytes.
-    pub fn set_userdata(&mut self, userdata: &[u8]) {
-        assert_userdata_fits(userdata);
-        unsafe {
-            rdsys::rd_kafka_assignor_member_set_userdata(
-                self.ptr,
-                userdata.as_ptr() as *const c_void,
-                userdata.len(),
-            )
         }
     }
 }
