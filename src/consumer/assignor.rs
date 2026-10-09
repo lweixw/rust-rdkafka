@@ -15,14 +15,17 @@
 //! when it is a built-in assignor's name, or when `heartbeat.interval.ms` is
 //! not less than `session.timeout.ms`.
 //!
-//! All three callbacks run on librdkafka's internal main thread. They must not
-//! block and must not call the consumer: methods such as
-//! [`Consumer::assignment`], [`Consumer::member_id`] and [`Consumer::committed`]
-//! wait for that thread. `assign` receives an [`AssignmentTask`] that it may
-//! complete inline or hand to another thread; the group's SyncGroup waits until
-//! the task completes, which must happen within `session.timeout.ms` less
-//! `heartbeat.interval.ms` of the JoinGroup response, or the library gives the
-//! assignment up and rejoins. A panic in a callback is caught at the FFI
+//! All three callbacks run on librdkafka's internal main thread, outside any
+//! async runtime. They must not block and must not call the consumer: methods
+//! such as [`Consumer::assignment`], [`Consumer::member_id`] and
+//! [`Consumer::committed`] wait for that thread. `assign` receives an
+//! [`AssignmentTask`] that it may complete inline or hand to another thread
+//! (through a stored runtime handle, say); once `assign` has returned, the
+//! thread holding the task may call the consumer. No heartbeat is sent while
+//! the assignment is pending and every member's SyncGroup waits for it, so the
+//! task must complete within `session.timeout.ms` less `heartbeat.interval.ms`
+//! of the JoinGroup response, or the library gives the assignment up and
+//! rejoins. A panic in a callback is caught at the FFI
 //! boundary and logged: a panicking `subscription_userdata` sends no userdata,
 //! a panicking `assign` fails the assignment (the group rejoins), and a
 //! panicking `on_assignment` leaves the assignment applied.
@@ -101,7 +104,10 @@ impl AssignedGroup {
 }
 
 /// An application partition assignor, see the [module documentation](self).
-pub trait PartitionAssignor {
+///
+/// The callbacks run on librdkafka's thread while the application may use
+/// the same assignor from its own, hence the bounds.
+pub trait PartitionAssignor: Send + Sync {
     /// The name `partition.assignment.strategy` selects the assignor by.
     ///
     /// Non-empty, without commas or whitespace, and not a built-in assignor's
@@ -140,7 +146,9 @@ pub trait PartitionAssignor {
     /// Receives the partitions and userdata the leader assigned to this
     /// member, before the assignment is applied.
     ///
-    /// `userdata` is empty when the leader assigned none.
+    /// Called on every successful SyncGroup, with an empty list and empty
+    /// userdata when the leader assigned this member nothing; not called when
+    /// the SyncGroup fails. `userdata` is empty when the leader assigned none.
     #[allow(unused_variables)]
     fn on_assignment(
         &self,
@@ -160,8 +168,11 @@ pub trait PartitionAssignor {
 /// thread and completed there. A task that is dropped without being completed
 /// fails the assignment and the group rejoins, as does [`fail`](AssignmentTask::fail).
 ///
-/// A task completed after the group rejoined, unsubscribed or gave the
-/// assignment up, or after the consumer was dropped, is discarded.
+/// A task completed after the group rejoined, unsubscribed, picked another
+/// assignor or gave the assignment up, or after the consumer was dropped, is
+/// discarded. A task
+/// that is neither completed nor dropped (`mem::forget`) leaks its members,
+/// and the library gives the assignment up when its budget runs out.
 pub struct AssignmentTask {
     pending: *mut RDKafkaAssignorPending,
     members: *mut RDKafkaAssignorMember,
@@ -262,10 +273,14 @@ impl GroupMember<'_> {
 
     /// The topics the member subscribed to.
     pub fn subscription(&self) -> Vec<String> {
-        let list = unsafe { borrowed_list(rdsys::rd_kafka_assignor_member_subscription(self.ptr)) };
-        list.elements()
+        let list = unsafe { rdsys::rd_kafka_assignor_member_subscription(self.ptr) };
+        if list.is_null() {
+            return Vec::new();
+        }
+        let elems = unsafe { slice::from_raw_parts((*list).elems, (*list).cnt as usize) };
+        elems
             .iter()
-            .map(|e| e.topic().to_owned())
+            .map(|e| unsafe { cstr_to_owned(e.topic) })
             .collect()
     }
 
@@ -277,8 +292,7 @@ impl GroupMember<'_> {
         if ptr.is_null() {
             None
         } else {
-            let list = unsafe { borrowed_list(ptr) };
-            Some(TopicPartitionList::clone(&list))
+            Some(unsafe { copied_list(ptr) })
         }
     }
 
@@ -337,10 +351,24 @@ unsafe fn opt_str_from_ptr<'a>(ptr: *const c_char) -> Option<&'a str> {
     }
 }
 
-/// Views a list librdkafka owns as a `TopicPartitionList` without taking
-/// ownership: the view must not outlive the call that handed the pointer out.
-unsafe fn borrowed_list(ptr: *const RDKafkaTopicPartitionList) -> ManuallyDrop<TopicPartitionList> {
-    ManuallyDrop::new(TopicPartitionList::from_ptr(ptr as *mut _))
+/// Copies a list librdkafka owns into a `TopicPartitionList` of our own.
+/// `TopicPartitionList` hands out writable elements from a shared reference,
+/// so a view over librdkafka's `const` list would let safe code write into
+/// memory the library goes on to use.
+unsafe fn copied_list(ptr: *const RDKafkaTopicPartitionList) -> TopicPartitionList {
+    TopicPartitionList::from_ptr(rdsys::rd_kafka_topic_partition_list_copy(ptr))
+}
+
+/// Logs a panic a callback caught. The payload is dropped and the logger is
+/// called under their own catch, so that neither can unwind across the
+/// `extern "C"` boundary.
+fn log_caught_panic(result: Result<(), Box<dyn std::any::Any + Send>>, message: &str) {
+    if let Err(payload) = result {
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            drop(payload);
+            error!("{}", message);
+        }));
+    }
 }
 
 /// Registers the context's assignor on the native configuration, with the
@@ -401,9 +429,9 @@ unsafe extern "C" fn subscription_cb<C: ConsumerContext>(
         let owned = if owned_partitions.is_null() {
             None
         } else {
-            Some(borrowed_list(owned_partitions))
+            Some(copied_list(owned_partitions))
         };
-        let bytes = assignor_of::<C>(opaque).subscription_userdata(&topics, owned.as_deref());
+        let bytes = assignor_of::<C>(opaque).subscription_userdata(&topics, owned.as_ref());
         assert_userdata_fits(&bytes);
         bytes
     }));
@@ -415,7 +443,10 @@ unsafe extern "C" fn subscription_cb<C: ConsumerContext>(
             *userdata_size = bytes.len();
         }
         Ok(_) => {}
-        Err(_) => error!("partition assignor panicked in subscription_userdata; sending none"),
+        Err(payload) => log_caught_panic(
+            Err(payload),
+            "partition assignor panicked in subscription_userdata; sending none",
+        ),
     }
 }
 
@@ -441,9 +472,10 @@ unsafe extern "C" fn assign_cb<C: ConsumerContext>(
         let metadata = ManuallyDrop::new(Metadata::from_ptr(metadata));
         assignor_of::<C>(opaque).assign(str_from_ptr(member_id), &metadata, task);
     }));
-    if result.is_err() {
-        error!("partition assignor panicked in assign; the group rejoins");
-    }
+    log_caught_panic(
+        result,
+        "partition assignor panicked in assign; the group rejoins",
+    );
     RDKafkaAssignorResult::RD_KAFKA_ASSIGNOR_PENDING
 }
 
@@ -456,7 +488,7 @@ unsafe extern "C" fn on_assignment_cb<C: ConsumerContext>(
     opaque: *mut c_void,
 ) {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let assignment = borrowed_list(assignment);
+        let assignment = copied_list(assignment);
         let userdata = if userdata.is_null() {
             &[][..]
         } else {
@@ -465,7 +497,8 @@ unsafe extern "C" fn on_assignment_cb<C: ConsumerContext>(
         let group = AssignedGroup::from_ptr(group_metadata);
         assignor_of::<C>(opaque).on_assignment(&assignment, userdata, &group);
     }));
-    if result.is_err() {
-        error!("partition assignor panicked in on_assignment; the assignment stands");
-    }
+    log_caught_panic(
+        result,
+        "partition assignor panicked in on_assignment; the assignment stands",
+    );
 }
