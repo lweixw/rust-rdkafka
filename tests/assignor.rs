@@ -37,6 +37,7 @@ struct SubscriptionCall {
 /// What the leader saw in one `assign` call, members in id order.
 #[derive(Clone, Debug)]
 struct AssignCall {
+    leader_id: String,
     member_ids: Vec<String>,
     instance_ids: Vec<Option<String>>,
     rack_ids: Vec<Option<String>>,
@@ -62,12 +63,12 @@ enum Completion {
     Inline,
 }
 
-/// Assigns partition `p` to the member at index `p % n` (members in id
-/// order); under COOPERATIVE a partition owned by a member other than its
-/// target is withheld for that round, except once when `violate_once` is set,
-/// when it is moved in the same round (which the library rejects). The
-/// userdata assigned to a member is its subscription userdata reversed, with
-/// a suffix.
+/// Assigns partition `p` of a topic to the `p % n`-th of the `n` members
+/// subscribed to it (members in id order); under COOPERATIVE a partition
+/// owned by a member other than its target is withheld for that round,
+/// except once when `violate_once` is set, when it is moved in the same
+/// round (which the library rejects). The userdata assigned to a member is
+/// its subscription userdata reversed, with a suffix.
 struct RoundRobinAssignor {
     tag: Vec<u8>,
     protocol: AssignorProtocol,
@@ -106,6 +107,12 @@ fn partitions_of(list: &TopicPartitionList) -> Vec<(String, i32)> {
     out
 }
 
+fn sorted(topics: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = topics.iter().map(|t| t.to_string()).collect();
+    out.sort();
+    out
+}
+
 impl PartitionAssignor for RoundRobinAssignor {
     fn name(&self) -> &str {
         ASSIGNOR_NAME
@@ -124,7 +131,7 @@ impl PartitionAssignor for RoundRobinAssignor {
             .lock()
             .unwrap()
             .push(SubscriptionCall {
-                topics: topics.iter().map(|t| t.to_string()).collect(),
+                topics: sorted(topics),
                 owned: owned_partitions.map(partitions_of),
             });
         if self.panic_subscription.load(Ordering::SeqCst) {
@@ -133,7 +140,7 @@ impl PartitionAssignor for RoundRobinAssignor {
         self.tag.clone()
     }
 
-    fn assign(&self, _member_id: &str, metadata: &Metadata, task: AssignmentTask) {
+    fn assign(&self, member_id: &str, metadata: &Metadata, task: AssignmentTask) {
         // The metadata is valid during the call only: copy the partition
         // counts before the task leaves the thread.
         let partition_counts: BTreeMap<String, i32> = metadata
@@ -150,6 +157,7 @@ impl PartitionAssignor for RoundRobinAssignor {
         members.sort();
 
         let mut call = AssignCall {
+            leader_id: member_id.to_owned(),
             member_ids: Vec::new(),
             instance_ids: Vec::new(),
             rack_ids: Vec::new(),
@@ -170,23 +178,24 @@ impl PartitionAssignor for RoundRobinAssignor {
             call.instance_ids
                 .push(member.group_instance_id().map(str::to_owned));
             call.rack_ids.push(member.rack_id().map(str::to_owned));
-            call.subscriptions.push(
-                member
-                    .subscription()
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect(),
-            );
+            call.subscriptions.push(sorted(&member.subscription()));
             call.owned.push(owned);
             call.userdata.push(member.userdata().to_vec());
         }
+        let subscriptions = call.subscriptions.clone();
         self.assign_calls.lock().unwrap().push(call);
 
         let mut plan = Vec::new();
         let mut any_withheld = false;
         for (topic, count) in &partition_counts {
+            let subscribers: Vec<usize> = (0..n)
+                .filter(|rank| subscriptions[*rank].contains(topic))
+                .collect();
+            if subscribers.is_empty() {
+                continue;
+            }
             for p in 0..*count {
-                let target = (p as usize) % n;
+                let target = subscribers[(p as usize) % subscribers.len()];
                 let withheld = self.protocol == AssignorProtocol::Cooperative
                     && owner_of
                         .get(&(topic.clone(), p))
@@ -239,13 +248,13 @@ impl PartitionAssignor for RoundRobinAssignor {
     }
 }
 
-struct AssignorContext<A: PartitionAssignor + Send + Sync> {
+struct AssignorContext<A: PartitionAssignor> {
     assignor: Arc<A>,
     /// librdkafka log lines, for pinning what the library reported.
     log_lines: Mutex<Vec<String>>,
 }
 
-impl<A: PartitionAssignor + Send + Sync> AssignorContext<A> {
+impl<A: PartitionAssignor> AssignorContext<A> {
     fn new(assignor: Arc<A>) -> Self {
         AssignorContext {
             assignor,
@@ -264,7 +273,7 @@ impl<A: PartitionAssignor + Send + Sync> AssignorContext<A> {
     }
 }
 
-impl<A: PartitionAssignor + Send + Sync> ClientContext for AssignorContext<A> {
+impl<A: PartitionAssignor> ClientContext for AssignorContext<A> {
     fn log(&self, _level: RDKafkaLogLevel, fac: &str, log_message: &str) {
         self.log_lines
             .lock()
@@ -273,7 +282,7 @@ impl<A: PartitionAssignor + Send + Sync> ClientContext for AssignorContext<A> {
     }
 }
 
-impl<A: PartitionAssignor + Send + Sync> ConsumerContext for AssignorContext<A> {
+impl<A: PartitionAssignor> ConsumerContext for AssignorContext<A> {
     fn assignor(&self) -> Option<&dyn PartitionAssignor> {
         Some(&*self.assignor)
     }
@@ -297,7 +306,7 @@ fn consumer_config(bootstrap_servers: &str, group_id: &str) -> ClientConfig {
     config
 }
 
-fn create_consumer<A: PartitionAssignor + Send + Sync + 'static>(
+fn create_consumer<A: PartitionAssignor + 'static>(
     config: &ClientConfig,
     assignor: Arc<A>,
 ) -> BaseConsumer<AssignorContext<A>> {
@@ -340,6 +349,34 @@ async fn create_topic(kafka_context: &KafkaContext, name: &str, partitions: i32)
         )
         .await
         .expect("could not create topic");
+}
+
+/// Waits until the consumer's metadata shows the topic with `partitions`
+/// partitions, so that the first assignment round sees them all.
+fn wait_for_partitions<C: ConsumerContext>(
+    consumer: &BaseConsumer<C>,
+    topic: &str,
+    partitions: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let metadata = consumer
+            .fetch_metadata(Some(topic), Duration::from_secs(5))
+            .expect("metadata fetch failed");
+        if metadata
+            .topics()
+            .iter()
+            .any(|t| t.name() == topic && t.partitions().len() == partitions)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never showed {} partitions",
+            topic,
+            partitions
+        );
+    }
 }
 
 fn expected_userdata(tag: &[u8]) -> Vec<u8> {
@@ -482,10 +519,11 @@ fn test_assignor_registration_is_validated() {
     }
 }
 
-/// Two members under the EAGER protocol: the leader sees both subscriptions'
-/// userdata, owned partitions, rack and group instance ids, completes the
-/// assignment from a second thread, and both members receive the partitions
-/// and userdata it set, with the group identity of the generation.
+/// Two members under the EAGER protocol, the second subscribed to a second
+/// topic as well: the leader sees both subscriptions' topics, userdata, owned
+/// partitions, rack and group instance ids, completes the assignment from a
+/// second thread, and both members receive the partitions and userdata it
+/// set, with the group identity of the generation.
 #[tokio::test]
 async fn test_assignor_two_members_eager() {
     init_test_logger();
@@ -494,7 +532,9 @@ async fn test_assignor_two_members_eager() {
         .await
         .expect("could not create kafka context");
     let topic = rand_test_topic("test_assignor_two_members_eager");
+    let topic_b = rand_test_topic("test_assignor_two_members_eager_b");
     create_topic(&kafka_context, &topic, 4).await;
+    create_topic(&kafka_context, &topic_b, 1).await;
     let group = rand_test_group();
     let config = consumer_config(&kafka_context.bootstrap_servers, &group);
 
@@ -504,6 +544,8 @@ async fn test_assignor_two_members_eager() {
     let assignor2 = RoundRobinAssignor::new(&tag2, AssignorProtocol::Eager, Completion::Thread);
 
     let consumer1 = create_consumer(&config, assignor1.clone());
+    wait_for_partitions(&consumer1, &topic, 4);
+    wait_for_partitions(&consumer1, &topic_b, 1);
     consumer1.subscribe(&[topic.as_str()]).unwrap();
     poll_until(
         &[&consumer1],
@@ -517,22 +559,33 @@ async fn test_assignor_two_members_eager() {
         .set("client.rack", "rack-\u{fc}2")
         .set("group.instance.id", "inst-\u{df}2");
     let consumer2 = create_consumer(&config2, assignor2.clone());
-    consumer2.subscribe(&[topic.as_str()]).unwrap();
+    consumer2
+        .subscribe(&[topic_b.as_str(), topic.as_str()])
+        .unwrap();
     poll_until(
         &[&consumer1, &consumer2],
         Duration::from_secs(30),
-        || assignment_count(&consumer1) == 2 && assignment_count(&consumer2) == 2,
-        "two partitions per consumer",
+        || assignment_count(&consumer1) == 2 && assignment_count(&consumer2) == 3,
+        "two partitions for consumer1, three for consumer2",
     );
 
-    // The first member led both rounds.
+    let member_id1 = consumer1.member_id().unwrap();
+    let member_id2 = consumer2.member_id().unwrap();
+    let two_topics = sorted(&[&topic, &topic_b]);
+
+    // The first member led every round.
     let calls1 = assignor1.assign_calls.lock().unwrap().clone();
     assert!(
         assignor2.assign_calls.lock().unwrap().is_empty(),
         "consumer2 should not have led"
     );
+    assert!(
+        calls1.iter().all(|c| c.leader_id == member_id1),
+        "{:?}",
+        calls1
+    );
     let alone = &calls1[0];
-    assert_eq!(alone.member_ids.len(), 1);
+    assert_eq!(alone.member_ids, vec![member_id1.clone()]);
     assert_eq!(alone.subscriptions, vec![vec![topic.clone()]]);
     assert_eq!(alone.userdata, vec![tag1.clone()]);
     assert_eq!(alone.owned, vec![Some(Vec::new())]);
@@ -540,9 +593,6 @@ async fn test_assignor_two_members_eager() {
     assert_eq!(alone.rack_ids, vec![None]);
     let both = calls1.last().unwrap();
     assert_eq!(both.member_ids.len(), 2, "last call: {:?}", both);
-    assert_eq!(both.subscriptions, vec![vec![topic.clone()]; 2]);
-    let member_id1 = consumer1.member_id().unwrap();
-    let member_id2 = consumer2.member_id().unwrap();
     let rank1 = both
         .member_ids
         .iter()
@@ -553,6 +603,8 @@ async fn test_assignor_two_members_eager() {
         .iter()
         .position(|m| *m == member_id2)
         .unwrap();
+    assert_eq!(both.subscriptions[rank1], vec![topic.clone()]);
+    assert_eq!(both.subscriptions[rank2], two_topics);
     assert_eq!(both.userdata[rank1], tag1);
     assert_eq!(both.userdata[rank2], tag2);
     assert_eq!(both.instance_ids[rank1], None);
@@ -565,24 +617,28 @@ async fn test_assignor_two_members_eager() {
     assert_eq!(both.owned[rank1], Some(Vec::new()));
     assert_eq!(both.owned[rank2], Some(Vec::new()));
 
-    // Every subscription call named the topic. Under EAGER a member joins
-    // owning nothing, which the callback sees as no list; the leader reads
-    // the same member's owned partitions back as an empty list, because the
-    // subscription encoder writes an empty array for no list.
+    // Every subscription call named the member's topics. Under EAGER a member
+    // joins owning nothing, which the callback sees as no list; the leader
+    // reads the same member's owned partitions back as an empty list, because
+    // the subscription encoder writes an empty array for no list.
     let subs1 = assignor1.subscription_calls.lock().unwrap().clone();
     let subs2 = assignor2.subscription_calls.lock().unwrap().clone();
     assert!(subs1.len() >= 2, "subscription calls: {:?}", subs1);
-    assert!(!subs2.is_empty(), "subscription calls: {:?}", subs2);
     assert_eq!(topics_only(&subs1), vec![vec![topic.clone()]; subs1.len()]);
-    assert_eq!(topics_only(&subs2), vec![vec![topic.clone()]; subs2.len()]);
+    assert_eq!(topics_only(&subs2), vec![two_topics.clone(); subs2.len()]);
     assert_eq!(owned_only(&subs1), vec![None; subs1.len()]);
     assert_eq!(owned_only(&subs2), vec![None; subs2.len()]);
 
     let expected_partitions = |rank: usize| -> Vec<(String, i32)> {
-        (0..4)
+        let mut out: Vec<(String, i32)> = (0..4)
             .filter(|p| (*p as usize) % 2 == rank)
             .map(|p| (topic.clone(), p))
-            .collect()
+            .collect();
+        if rank == rank2 {
+            out.push((topic_b.clone(), 0));
+        }
+        out.sort();
+        out
     };
     let assigned1 = assignor1.assignments.lock().unwrap().clone();
     let assigned2 = assignor2.assignments.lock().unwrap().clone();
@@ -608,6 +664,10 @@ async fn test_assignor_two_members_eager() {
         last2.group.group_instance_id,
         Some("inst-\u{df}2".to_owned())
     );
+    assert!(matches!(
+        consumer1.rebalance_protocol(),
+        RebalanceProtocol::Eager
+    ));
 }
 
 /// Under COOPERATIVE the fork applies no adjustment to the application's
@@ -642,6 +702,7 @@ async fn test_assignor_cooperative_handover() {
     assignor2.panic_subscription.store(true, Ordering::SeqCst);
 
     let consumer1 = create_consumer(&config, assignor1.clone());
+    wait_for_partitions(&consumer1, &topic, 2);
     consumer1.subscribe(&[topic.as_str()]).unwrap();
     poll_until(
         &[&consumer1],
@@ -668,14 +729,19 @@ async fn test_assignor_cooperative_handover() {
     let member_id2 = consumer2.member_id().unwrap();
     let calls1 = assignor1.assign_calls.lock().unwrap().clone();
     assert!(assignor2.assign_calls.lock().unwrap().is_empty());
+    assert!(
+        calls1.iter().all(|c| c.leader_id == member_id1),
+        "{:?}",
+        calls1
+    );
     // Three two-member rounds after however many solo ones.
     let first_two = calls1
         .iter()
         .position(|c| c.member_ids.len() == 2)
         .expect("a two-member round");
     assert!(calls1[..first_two].iter().all(|c| c.member_ids.len() == 1));
-    let calls1 = &calls1[first_two - 1..];
-    assert_eq!(calls1.len(), 4, "expected four rounds, saw {:?}", calls1);
+    let rounds = &calls1[first_two..];
+    assert_eq!(rounds.len(), 3, "expected three rounds, saw {:?}", rounds);
     let both = |call: &AssignCall| -> (usize, usize) {
         (
             call.member_ids
@@ -689,28 +755,28 @@ async fn test_assignor_cooperative_handover() {
         )
     };
     let owned_both = Some(vec![(topic.clone(), 0), (topic.clone(), 1)]);
-    // Round 2: consumer1 owned both partitions when consumer2 joined; the
+    // Round 1: consumer1 owned both partitions when consumer2 joined; the
     // leader moved one in the same round and the library rejected the
     // assignment.
-    let (rank1, rank2) = both(&calls1[1]);
-    assert_eq!(calls1[1].owned[rank1], owned_both);
-    assert_eq!(calls1[1].owned[rank2], Some(Vec::new()));
-    assert_eq!(calls1[1].userdata[rank1], b"eins-\xE2\x82\xAC");
-    assert_eq!(calls1[1].userdata[rank2], b"");
+    let (rank1, rank2) = both(&rounds[0]);
+    assert_eq!(rounds[0].owned[rank1], owned_both);
+    assert_eq!(rounds[0].owned[rank2], Some(Vec::new()));
+    assert_eq!(rounds[0].userdata[rank1], b"eins-\xE2\x82\xAC");
+    assert_eq!(rounds[0].userdata[rank2], b"");
     let violations = consumer1.context().log_lines_containing(VIOLATION);
     assert_eq!(violations.len(), 1, "log lines: {:?}", violations);
-    // Round 3: the same ownership, the moved partition now withheld.
-    assert_eq!(both(&calls1[2]), (rank1, rank2));
-    assert_eq!(calls1[2].owned[rank1], owned_both);
-    assert_eq!(calls1[2].owned[rank2], Some(Vec::new()));
-    assert_eq!(calls1[2].userdata[rank2], b"");
-    // Round 4: the withheld partition had been revoked.
-    assert_eq!(both(&calls1[3]), (rank1, rank2));
+    // Round 2: the same ownership, the moved partition now withheld.
+    assert_eq!(both(&rounds[1]), (rank1, rank2));
+    assert_eq!(rounds[1].owned[rank1], owned_both);
+    assert_eq!(rounds[1].owned[rank2], Some(Vec::new()));
+    assert_eq!(rounds[1].userdata[rank2], b"");
+    // Round 3: the withheld partition had been revoked.
+    assert_eq!(both(&rounds[2]), (rank1, rank2));
     assert_eq!(
-        calls1[3].owned[rank1],
+        rounds[2].owned[rank1],
         Some(vec![(topic.clone(), rank1 as i32)])
     );
-    assert_eq!(calls1[3].owned[rank2], Some(Vec::new()));
+    assert_eq!(rounds[2].owned[rank2], Some(Vec::new()));
 
     let subs1 = assignor1.subscription_calls.lock().unwrap().clone();
     let subs2 = assignor2.subscription_calls.lock().unwrap().clone();
@@ -760,8 +826,9 @@ async fn test_assignor_cooperative_handover() {
 /// An assignment the leader drops, panics on, fails or holds past the budget
 /// is a failed round: the group rejoins and the next round's assignment goes
 /// through; no assignment reaches the members for the failed rounds, the
-/// late completion of the held round is discarded, and a panicking
-/// `on_assignment` leaves the assignment applied.
+/// late completion of the held round is discarded, a panic after the task
+/// was handed off does not fail it, and a panicking `on_assignment` leaves
+/// the assignment applied.
 #[tokio::test]
 async fn test_assignor_failed_rounds_rejoin() {
     init_test_logger();
@@ -771,6 +838,8 @@ async fn test_assignor_failed_rounds_rejoin() {
         assignments: Mutex<Vec<Assigned>>,
         /// The userdata the final round saw on the member.
         userdata_seen: Mutex<Option<Vec<u8>>>,
+        /// Whether `member(1)` of one member panicked in the final round.
+        out_of_range_panicked: AtomicBool,
         held: Mutex<Option<JoinHandle<()>>>,
         panic_on_assignment_once: AtomicBool,
     }
@@ -806,9 +875,16 @@ async fn test_assignor_failed_rounds_rejoin() {
                     let out_of_range = panic::catch_unwind(AssertUnwindSafe(|| {
                         task.member(1);
                     }));
-                    assert!(out_of_range.is_err(), "member(1) of one member must panic");
-                    task.set_assignment(0, &list);
-                    task.complete();
+                    self.out_of_range_panicked
+                        .store(out_of_range.is_err(), Ordering::SeqCst);
+                    task.set_userdata(0, &[]);
+                    // Handed off, then a panic: the round still goes through.
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(300));
+                        task.set_assignment(0, &list);
+                        task.complete();
+                    });
+                    panic!("the assignor panics after handing its task off");
                 }
             }
         }
@@ -841,10 +917,12 @@ async fn test_assignor_failed_rounds_rejoin() {
         calls: AtomicUsize::new(0),
         assignments: Mutex::new(Vec::new()),
         userdata_seen: Mutex::new(None),
+        out_of_range_panicked: AtomicBool::new(false),
         held: Mutex::new(None),
         panic_on_assignment_once: AtomicBool::new(true),
     });
     let consumer = create_consumer(&config, assignor.clone());
+    wait_for_partitions(&consumer, &topic, 2);
     consumer.subscribe(&[topic.as_str()]).unwrap();
     poll_until(
         &[&consumer],
@@ -863,10 +941,11 @@ async fn test_assignor_failed_rounds_rejoin() {
     assert_eq!(assigned[0].userdata, b"");
     assert_eq!(assigned[0].group.member_id, consumer.member_id().unwrap());
     assert_eq!(*assignor.userdata_seen.lock().unwrap(), Some(Vec::new()));
-    assert!(!assignor.panic_on_assignment_once.load(Ordering::SeqCst));
+    assert!(assignor.out_of_range_panicked.load(Ordering::SeqCst));
     // The dropped and the panicking rounds were completed by the task's drop,
     // the third by `fail` with its reason (the NUL stripped), the fourth given
-    // up by the library.
+    // up by the library; the fifth round's panic, after the hand-off, failed
+    // nothing.
     let context = consumer.context();
     assert_eq!(context.log_lines_containing(DROPPED).len(), 2);
     let failed = context.log_lines_containing("the assignor \u{2718} declines its third call");
@@ -875,7 +954,10 @@ async fn test_assignor_failed_rounds_rejoin() {
     assert_eq!(given_up.len(), 1, "log lines: {:?}", given_up);
 
     // The held round's completion arrives after the group moved on: it is
-    // discarded, and nothing changes.
+    // discarded, and nothing changes. (The group is stable by then, so this
+    // exercises the state check; the pending-id check is the C suite's.) A
+    // completion applied anyway would send a SyncGroup and run on_assignment
+    // again, which the record count catches.
     let held = assignor.held.lock().unwrap().take().unwrap();
     while !held.is_finished() {
         consumer.poll(Duration::from_millis(100));
@@ -888,4 +970,55 @@ async fn test_assignor_failed_rounds_rejoin() {
     assert_eq!(assignor.calls.load(Ordering::SeqCst), 5);
     assert_eq!(assignment_count(&consumer), 2);
     assert_eq!(assignor.assignments.lock().unwrap().len(), 1);
+}
+
+/// A task completed, or dropped, after its consumer was dropped is a safe
+/// no-op: the pending handle outlives the client.
+#[tokio::test]
+async fn test_assignor_completion_after_consumer_dropped() {
+    init_test_logger();
+
+    struct HoldingAssignor {
+        held: Mutex<Option<AssignmentTask>>,
+    }
+    impl PartitionAssignor for HoldingAssignor {
+        fn name(&self) -> &str {
+            ASSIGNOR_NAME
+        }
+        fn protocol(&self) -> AssignorProtocol {
+            AssignorProtocol::Eager
+        }
+        fn assign(&self, _: &str, _: &Metadata, task: AssignmentTask) {
+            *self.held.lock().unwrap() = Some(task);
+        }
+    }
+
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+    let topic = rand_test_topic("test_assignor_completion_after_consumer_dropped");
+    create_topic(&kafka_context, &topic, 1).await;
+    let group = rand_test_group();
+    let config = consumer_config(&kafka_context.bootstrap_servers, &group);
+
+    for complete in [true, false] {
+        let assignor = Arc::new(HoldingAssignor {
+            held: Mutex::new(None),
+        });
+        let consumer = create_consumer(&config, assignor.clone());
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+        poll_until(
+            &[&consumer],
+            Duration::from_secs(30),
+            || assignor.held.lock().unwrap().is_some(),
+            "the assignor to hold a task",
+        );
+        drop(consumer);
+        let task = assignor.held.lock().unwrap().take().unwrap();
+        if complete {
+            task.complete();
+        } else {
+            drop(task);
+        }
+    }
 }

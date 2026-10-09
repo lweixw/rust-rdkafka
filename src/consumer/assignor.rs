@@ -27,8 +27,9 @@
 //! of the JoinGroup response, or the library gives the assignment up and
 //! rejoins. A panic in a callback is caught at the FFI boundary and logged: a
 //! panicking `subscription_userdata` sends no userdata, a panicking `assign`
-//! fails the assignment (the group rejoins) unless the task was already handed
-//! off, and a panicking `on_assignment` leaves the assignment applied.
+//! fails the assignment (the group rejoins) unless the task was already
+//! completed or handed off, and a panicking `on_assignment` leaves the
+//! assignment applied.
 //!
 //! Under [`AssignorProtocol::Cooperative`] the post-assignment adjustment the
 //! built-in assignors rely on is not applied: the assignor itself withholds a
@@ -181,7 +182,6 @@ pub trait PartitionAssignor: Send + Sync {
 /// discarded. A task
 /// that is neither completed nor dropped (`mem::forget`) leaks its members,
 /// and the library gives the assignment up when its budget runs out.
-#[must_use = "dropping the task fails the assignment"]
 pub struct AssignmentTask {
     pending: *mut RDKafkaAssignorPending,
     members: *mut RDKafkaAssignorMember,
@@ -309,7 +309,8 @@ impl GroupMember<'_> {
     /// The topics the member subscribed to.
     pub fn subscription(&self) -> Vec<&str> {
         let list = unsafe { rdsys::rd_kafka_assignor_member_subscription(self.ptr) };
-        if list.is_null() {
+        // An empty list may have no element array at all.
+        if list.is_null() || unsafe { (*list).cnt } <= 0 {
             return Vec::new();
         }
         let elems = unsafe { slice::from_raw_parts((*list).elems, (*list).cnt as usize) };
@@ -379,10 +380,14 @@ unsafe fn copied_list(ptr: *const RDKafkaTopicPartitionList) -> TopicPartitionLi
 /// `extern "C"` boundary.
 fn log_caught_panic(result: Result<(), Box<dyn std::any::Any + Send>>, message: &str) {
     if let Err(payload) = result {
-        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+        let again = panic::catch_unwind(AssertUnwindSafe(move || {
             drop(payload);
             error!("{}", message);
         }));
+        if let Err(payload) = again {
+            // A payload whose drop panics is leaked rather than dropped here.
+            std::mem::forget(payload);
+        }
     }
 }
 
@@ -487,10 +492,7 @@ unsafe extern "C" fn assign_cb<C: ConsumerContext>(
         let metadata = ManuallyDrop::new(Metadata::from_ptr(metadata));
         assignor_of::<C>(opaque).assign(str_from_ptr(member_id), &metadata, task);
     }));
-    log_caught_panic(
-        result,
-        "partition assignor panicked in assign; the group rejoins",
-    );
+    log_caught_panic(result, "partition assignor panicked in assign");
     RDKafkaAssignorResult::RD_KAFKA_ASSIGNOR_PENDING
 }
 
