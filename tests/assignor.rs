@@ -376,6 +376,7 @@ fn wait_for_partitions<C: ConsumerContext>(
             topic,
             partitions
         );
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -972,8 +973,9 @@ async fn test_assignor_failed_rounds_rejoin() {
     assert_eq!(assignor.assignments.lock().unwrap().len(), 1);
 }
 
-/// A task completed, or dropped, after its consumer was dropped is a safe
-/// no-op: the pending handle outlives the client.
+/// A task completed, or dropped, after its consumer was dropped neither
+/// panics nor hangs the close: the pending handle outlives the client. (The
+/// memory safety of that path is the C suite's, under ASan.)
 #[tokio::test]
 async fn test_assignor_completion_after_consumer_dropped() {
     init_test_logger();

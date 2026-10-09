@@ -123,7 +123,8 @@ pub trait ConsumerContext: ClientContext + Sized {
     /// Read when the consumer is created, for the registration (name and
     /// protocol are read then only), and again on every callback, so it must
     /// keep returning the same assignor: a callback that finds `None` is
-    /// logged and does nothing, which fails an assignment.
+    /// caught and logged like a panic, and in `assign` that fails the
+    /// assignment.
     fn assignor(&self) -> Option<&dyn PartitionAssignor> {
         None
     }

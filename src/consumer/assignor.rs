@@ -179,9 +179,9 @@ pub trait PartitionAssignor: Send + Sync {
 ///
 /// A task completed after the group rejoined, unsubscribed, picked another
 /// assignor or gave the assignment up, or after the consumer was dropped, is
-/// discarded. A task
-/// that is neither completed nor dropped (`mem::forget`) leaks its members,
-/// and the library gives the assignment up when its budget runs out.
+/// discarded. A task that is neither completed nor dropped (`mem::forget`)
+/// leaks its members, and the library gives the assignment up when its budget
+/// runs out.
 pub struct AssignmentTask {
     pending: *mut RDKafkaAssignorPending,
     members: *mut RDKafkaAssignorMember,
