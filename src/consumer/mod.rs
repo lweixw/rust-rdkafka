@@ -16,10 +16,14 @@ use crate::metadata::Metadata;
 use crate::topic_partition_list::{Offset, TopicPartitionList};
 use crate::util::{KafkaDrop, NativePtr, Timeout};
 
+pub mod assignor;
 pub mod base_consumer;
 pub mod stream_consumer;
 
 // Re-exports.
+pub use self::assignor::{
+    AssignedGroup, AssignmentTask, AssignorProtocol, GroupMember, PartitionAssignor,
+};
 #[doc(inline)]
 pub use self::base_consumer::BaseConsumer;
 #[doc(inline)]
@@ -112,6 +116,15 @@ pub trait ConsumerContext: ClientContext + Sized {
     /// committed to the offset store.
     #[allow(unused_variables)]
     fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {}
+
+    /// The application partition assignor this consumer registers with
+    /// librdkafka, if any; see [`PartitionAssignor`].
+    ///
+    /// Read once when the consumer is created and again on every callback,
+    /// so it must keep returning the same assignor.
+    fn assignor(&self) -> Option<&dyn PartitionAssignor> {
+        None
+    }
 
     /// Returns the minimum interval at which to poll the main queue, which
     /// services the logging, stats, and error events.

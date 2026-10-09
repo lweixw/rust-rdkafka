@@ -4,6 +4,11 @@ See also the [rdkafka-sys changelog](rdkafka-sys/changelog.md).
 
 ## Unreleased
 
+* Add `PartitionAssignor`, an application partition assignor for the classic
+  group protocol, registered through `ConsumerContext::assignor` and selected by
+  name in `partition.assignment.strategy`. The leader's `assign` receives an
+  `AssignmentTask` it completes inline or from another thread; the SyncGroup
+  waits for it. Needs the lweixw/librdkafka fork the submodule now points at.
 * Add `Consumer::partition_position`, `Consumer::get_watermark_offsets` and
   `Consumer::member_id`, wrapping `rd_kafka_position` over one partition,
   `rd_kafka_get_watermark_offsets` and `rd_kafka_memberid`.

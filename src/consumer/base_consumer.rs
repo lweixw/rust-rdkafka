@@ -17,7 +17,7 @@ use crate::config::{
     ClientConfig, FromClientConfig, FromClientConfigAndContext, NativeClientConfig,
 };
 use crate::consumer::{
-    CommitMode, Consumer, ConsumerContext, ConsumerGroupMetadata, DefaultConsumerContext,
+    assignor, CommitMode, Consumer, ConsumerContext, ConsumerGroupMetadata, DefaultConsumerContext,
     RebalanceProtocol,
 };
 use crate::error::{IsError, KafkaError, KafkaResult, RDKafkaError};
@@ -88,7 +88,17 @@ where
                     | rdsys::RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH,
             )
         };
-        let client = Client::new(
+        // The context is the assignor callbacks' opaque, so it is built here
+        // and handed to the client, which drops the native handle before it.
+        let context = Arc::new(context);
+        if let Some(assignor) = context.assignor() {
+            assignor::register::<C>(
+                &native_config,
+                assignor,
+                Arc::as_ptr(&context) as *mut c_void,
+            )?;
+        }
+        let client = Client::new_context_arc(
             config,
             native_config,
             RDKafkaType::RD_KAFKA_CONSUMER,
