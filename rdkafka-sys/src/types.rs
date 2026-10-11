@@ -48,6 +48,18 @@ pub type RDKafkaMetadataBroker = bindings::rd_kafka_metadata_broker_t;
 /// Native rdkafka consumer group metadata.
 pub type RDKafkaConsumerGroupMetadata = bindings::rd_kafka_consumer_group_metadata_t;
 
+/// Native rdkafka application assignor member handle.
+pub type RDKafkaAssignorMember = bindings::rd_kafka_assignor_member_t;
+
+/// Native rdkafka application assignor pending-assignment handle.
+pub type RDKafkaAssignorPending = bindings::rd_kafka_assignor_pending_t;
+
+/// Native rdkafka application assignor result.
+pub type RDKafkaAssignorResult = bindings::rd_kafka_assignor_result_t;
+
+/// Native rdkafka application assignor rebalance protocol.
+pub type RDKafkaAssignorProtocol = bindings::rd_kafka_assignor_protocol_t;
+
 /// Native rdkafka state.
 pub type RDKafkaState = bindings::rd_kafka_s;
 

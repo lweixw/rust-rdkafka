@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+* Point the librdkafka submodule at the lweixw/librdkafka fork (`kstream` branch
+  on v2.12.1) and bind its application assignor API: `rd_kafka_conf_set_assignor`,
+  the `rd_kafka_assignor_member_*` accessors and `rd_kafka_assignor_complete`.
+
 ## v4.10.0+2.12.1 (2026-01-25)
 * Bump librdkafka to v2.12.1.
 * Fix build script for musl builds that require SASL ([#818])

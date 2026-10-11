@@ -789,6 +789,131 @@ extern "C" {
         >,
     );
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rd_kafka_assignor_member_s {
+    _unused: [u8; 0],
+}
+pub type rd_kafka_assignor_member_t = rd_kafka_assignor_member_s;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rd_kafka_assignor_pending_s {
+    _unused: [u8; 0],
+}
+pub type rd_kafka_assignor_pending_t = rd_kafka_assignor_pending_s;
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum rd_kafka_assignor_result_t {
+    RD_KAFKA_ASSIGNOR_DONE = 0,
+    RD_KAFKA_ASSIGNOR_PENDING = 1,
+    RD_KAFKA_ASSIGNOR_FAILED = 2,
+}
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum rd_kafka_assignor_protocol_t {
+    RD_KAFKA_ASSIGNOR_PROTOCOL_EAGER = 0,
+    RD_KAFKA_ASSIGNOR_PROTOCOL_COOPERATIVE = 1,
+}
+pub type rd_kafka_assignor_subscription_cb_t = Option<
+    unsafe extern "C" fn(
+        rk: *mut rd_kafka_t,
+        topics: *const *const c_char,
+        topic_cnt: usize,
+        owned_partitions: *const rd_kafka_topic_partition_list_t,
+        userdata: *mut *mut c_void,
+        userdata_size: *mut usize,
+        opaque: *mut c_void,
+    ),
+>;
+pub type rd_kafka_assignor_assign_cb_t = Option<
+    unsafe extern "C" fn(
+        rk: *mut rd_kafka_t,
+        member_id: *const c_char,
+        metadata: *const rd_kafka_metadata,
+        members: *mut rd_kafka_assignor_member_t,
+        member_cnt: usize,
+        pending: *mut rd_kafka_assignor_pending_t,
+        errstr: *mut c_char,
+        errstr_size: usize,
+        opaque: *mut c_void,
+    ) -> rd_kafka_assignor_result_t,
+>;
+pub type rd_kafka_assignor_on_assignment_cb_t = Option<
+    unsafe extern "C" fn(
+        rk: *mut rd_kafka_t,
+        assignment: *const rd_kafka_topic_partition_list_t,
+        userdata: *const c_void,
+        userdata_size: usize,
+        group_metadata: *const rd_kafka_consumer_group_metadata_t,
+        opaque: *mut c_void,
+    ),
+>;
+extern "C" {
+    pub fn rd_kafka_conf_set_assignor(
+        conf: *mut rd_kafka_conf_t,
+        protocol_name: *const c_char,
+        protocol: rd_kafka_assignor_protocol_t,
+        subscription_cb: rd_kafka_assignor_subscription_cb_t,
+        assign_cb: rd_kafka_assignor_assign_cb_t,
+        on_assignment_cb: rd_kafka_assignor_on_assignment_cb_t,
+        opaque: *mut c_void,
+    );
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_at(
+        members: *mut rd_kafka_assignor_member_t,
+        idx: usize,
+    ) -> *mut rd_kafka_assignor_member_t;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_id(member: *const rd_kafka_assignor_member_t) -> *const c_char;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_group_instance_id(
+        member: *const rd_kafka_assignor_member_t,
+    ) -> *const c_char;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_rack_id(
+        member: *const rd_kafka_assignor_member_t,
+    ) -> *const c_char;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_subscription(
+        member: *const rd_kafka_assignor_member_t,
+    ) -> *const rd_kafka_topic_partition_list_t;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_owned_partitions(
+        member: *const rd_kafka_assignor_member_t,
+    ) -> *const rd_kafka_topic_partition_list_t;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_userdata(
+        member: *const rd_kafka_assignor_member_t,
+        sizep: *mut usize,
+    ) -> *const c_void;
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_set_assignment(
+        member: *mut rd_kafka_assignor_member_t,
+        assignment: *const rd_kafka_topic_partition_list_t,
+    );
+}
+extern "C" {
+    pub fn rd_kafka_assignor_member_set_userdata(
+        member: *mut rd_kafka_assignor_member_t,
+        userdata: *const c_void,
+        size: usize,
+    );
+}
+extern "C" {
+    pub fn rd_kafka_assignor_complete(
+        pending: *mut rd_kafka_assignor_pending_t,
+        err: rd_kafka_resp_err_t,
+        errstr: *const c_char,
+    );
+}
 extern "C" {
     pub fn rd_kafka_conf_set_offset_commit_cb(
         conf: *mut rd_kafka_conf_t,
