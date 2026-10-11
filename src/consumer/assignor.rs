@@ -11,9 +11,10 @@
 //! with librdkafka when the consumer is created. `partition.assignment.strategy`
 //! must then name it, alone or alongside built-in assignors of the same
 //! protocol; a registration the strategy does not name is unused. Creating the
-//! consumer fails when the name is empty or contains a comma or whitespace,
-//! when it is a built-in assignor's name, or when `heartbeat.interval.ms` is
-//! not less than `session.timeout.ms`.
+//! consumer fails when the name is empty or contains a comma, a space, a tab
+//! or a line break, when it is a built-in assignor's name, or when
+//! `heartbeat.interval.ms` is not less than `session.timeout.ms`; a name with
+//! a NUL fails with [`KafkaError::Nul`].
 //!
 //! All three callbacks run on librdkafka's internal main thread, outside any
 //! async runtime. They must not block and must not call the consumer: methods
@@ -44,14 +45,18 @@
 //! [`Consumer::assignment`]: crate::consumer::Consumer::assignment
 //! [`Consumer::member_id`]: crate::consumer::Consumer::member_id
 //! [`Consumer::committed`]: crate::consumer::Consumer::committed
+//! [`KafkaError::Nul`]: crate::error::KafkaError::Nul
 
+use std::any::Any;
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
-use std::slice;
+use std::sync::Arc;
 
 use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
@@ -62,7 +67,7 @@ use crate::error::KafkaResult;
 use crate::log::error;
 use crate::metadata::Metadata;
 use crate::topic_partition_list::TopicPartitionList;
-use crate::util::cstr_to_owned;
+use crate::util::{cstr_to_owned, ptr_to_slice};
 
 /// The rebalance protocol an application assignor speaks.
 ///
@@ -116,8 +121,8 @@ impl AssignedGroup {
 pub trait PartitionAssignor: Send + Sync {
     /// The name `partition.assignment.strategy` selects the assignor by.
     ///
-    /// Non-empty, without commas or whitespace, and not a built-in assignor's
-    /// name (`range`, `roundrobin`, `cooperative-sticky`).
+    /// Non-empty, without commas, spaces, tabs, line breaks or NULs, and not a
+    /// built-in assignor's name (`range`, `roundrobin`, `cooperative-sticky`).
     fn name(&self) -> &str;
 
     /// The rebalance protocol the assignor speaks.
@@ -126,8 +131,10 @@ pub trait PartitionAssignor: Send + Sync {
     /// Produces the userdata this member puts into its JoinGroup metadata.
     ///
     /// `topics` are the subscribed topic names and `owned_partitions` the
-    /// partitions this member owns going into the rebalance, when librdkafka
-    /// knows them. An empty return sends no userdata, which is the default.
+    /// partitions this member owns going into the rebalance: `None` when it
+    /// owns nothing yet, which under [`AssignorProtocol::Eager`] is always (the
+    /// leader then reads the same member's owned partitions back as an empty
+    /// list). An empty return sends no userdata, which is the default.
     #[allow(unused_variables)]
     fn subscription_userdata(
         &self,
@@ -251,72 +258,76 @@ impl AssignmentTask {
 
     fn finish(mut self, err: RDKafkaRespErr, reason: Option<&str>) {
         let reason = reason.map(|reason| {
-            let bytes: Vec<u8> = reason.bytes().filter(|&b| b != 0).collect();
-            CString::new(bytes).expect("interior NULs were removed")
+            CString::new(reason.replace('\0', "")).expect("interior NULs were removed")
         });
+        self.complete_pending(err, reason.as_ref().map_or(ptr::null(), |r| r.as_ptr()));
+    }
+
+    /// Completes the pending handle once; later calls do nothing.
+    fn complete_pending(&mut self, err: RDKafkaRespErr, reason: *const c_char) {
         let pending = std::mem::replace(&mut self.pending, ptr::null_mut());
-        unsafe {
-            rdsys::rd_kafka_assignor_complete(
-                pending,
-                err,
-                reason.as_ref().map_or(ptr::null(), |r| r.as_ptr()),
-            )
+        if !pending.is_null() {
+            unsafe { rdsys::rd_kafka_assignor_complete(pending, err, reason) }
         }
     }
 }
 
+const DROPPED: &[u8] = b"assignment task dropped without completing\0";
+
 impl Drop for AssignmentTask {
     fn drop(&mut self) {
-        if self.pending.is_null() {
-            return;
-        }
-        let reason = CStr::from_bytes_with_nul(b"assignment task dropped without completing\0")
-            .expect("a NUL-terminated literal");
-        let pending = std::mem::replace(&mut self.pending, ptr::null_mut());
-        unsafe {
-            rdsys::rd_kafka_assignor_complete(
-                pending,
-                RDKafkaRespErr::RD_KAFKA_RESP_ERR__FAIL,
-                reason.as_ptr(),
-            )
-        }
+        self.complete_pending(
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__FAIL,
+            DROPPED.as_ptr() as *const c_char,
+        );
+    }
+}
+
+impl fmt::Debug for AssignmentTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssignmentTask")
+            .field("member_count", &self.member_count)
+            .field("completed", &self.pending.is_null())
+            .finish()
     }
 }
 
 /// One member of the group, as seen by the leader's
-/// [`PartitionAssignor::assign`]. Reads only; the task sets.
+/// [`PartitionAssignor::assign`]. Reads only; the task sets. The reads borrow
+/// the task, so they may be collected across members and live until the task
+/// is set or completed.
+///
+/// The member's rack, topic names and owned partitions are the bytes it put
+/// into its JoinGroup metadata, which nothing validates; they are decoded
+/// lossily, as Java does, so a member sending non-UTF-8 cannot fail the
+/// leader.
 pub struct GroupMember<'a> {
     ptr: *const RDKafkaAssignorMember,
     _task: PhantomData<&'a AssignmentTask>,
 }
 
-impl GroupMember<'_> {
+impl<'a> GroupMember<'a> {
     /// The member id.
-    pub fn id(&self) -> &str {
-        unsafe { str_from_ptr(rdsys::rd_kafka_assignor_member_id(self.ptr)) }
+    pub fn id(&self) -> Cow<'a, str> {
+        unsafe { lossy_str(rdsys::rd_kafka_assignor_member_id(self.ptr)) }
     }
 
     /// The member's `group.instance.id`, if it has one.
-    pub fn group_instance_id(&self) -> Option<&str> {
-        unsafe { opt_str_from_ptr(rdsys::rd_kafka_assignor_member_group_instance_id(self.ptr)) }
+    pub fn group_instance_id(&self) -> Option<Cow<'a, str>> {
+        unsafe { opt_lossy_str(rdsys::rd_kafka_assignor_member_group_instance_id(self.ptr)) }
     }
 
     /// The member's `client.rack`, if it reported one.
-    pub fn rack_id(&self) -> Option<&str> {
-        unsafe { opt_str_from_ptr(rdsys::rd_kafka_assignor_member_rack_id(self.ptr)) }
+    pub fn rack_id(&self) -> Option<Cow<'a, str>> {
+        unsafe { opt_lossy_str(rdsys::rd_kafka_assignor_member_rack_id(self.ptr)) }
     }
 
     /// The topics the member subscribed to.
-    pub fn subscription(&self) -> Vec<&str> {
+    pub fn subscription(&self) -> Vec<Cow<'a, str>> {
         let list = unsafe { rdsys::rd_kafka_assignor_member_subscription(self.ptr) };
-        // An empty list may have no element array at all.
-        if list.is_null() || unsafe { (*list).cnt } <= 0 {
-            return Vec::new();
-        }
-        let elems = unsafe { slice::from_raw_parts((*list).elems, (*list).cnt as usize) };
-        elems
+        unsafe { list_elems(list) }
             .iter()
-            .map(|e| unsafe { str_from_ptr(e.topic) })
+            .map(|e| unsafe { lossy_str(e.topic) })
             .collect()
     }
 
@@ -326,21 +337,29 @@ impl GroupMember<'_> {
     pub fn owned_partitions(&self) -> Option<TopicPartitionList> {
         let ptr = unsafe { rdsys::rd_kafka_assignor_member_owned_partitions(self.ptr) };
         if ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { copied_list(ptr) })
+            return None;
         }
+        let elems = unsafe { list_elems(ptr) };
+        let mut list = TopicPartitionList::with_capacity(elems.len());
+        for e in elems {
+            list.add_partition(&unsafe { lossy_str(e.topic) }, e.partition);
+        }
+        Some(list)
     }
 
     /// The userdata the member's subscription carried; empty when none.
-    pub fn userdata(&self) -> &[u8] {
+    pub fn userdata(&self) -> &'a [u8] {
         let mut size = 0;
         let data = unsafe { rdsys::rd_kafka_assignor_member_userdata(self.ptr, &mut size) };
-        if data.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(data as *const u8, size) }
-        }
+        unsafe { ptr_to_slice(data, size) }
+    }
+}
+
+impl fmt::Debug for GroupMember<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupMember")
+            .field("id", &self.id())
+            .finish()
     }
 }
 
@@ -353,18 +372,30 @@ fn assert_userdata_fits(userdata: &[u8]) {
     );
 }
 
-unsafe fn str_from_ptr<'a>(ptr: *const c_char) -> &'a str {
-    CStr::from_ptr(ptr)
-        .to_str()
-        .expect("librdkafka string is not UTF-8")
+/// A string librdkafka hands out, decoded lossily; a null pointer is empty.
+unsafe fn lossy_str<'a>(ptr: *const c_char) -> Cow<'a, str> {
+    if ptr.is_null() {
+        Cow::Borrowed("")
+    } else {
+        CStr::from_ptr(ptr).to_string_lossy()
+    }
 }
 
-unsafe fn opt_str_from_ptr<'a>(ptr: *const c_char) -> Option<&'a str> {
+unsafe fn opt_lossy_str<'a>(ptr: *const c_char) -> Option<Cow<'a, str>> {
     if ptr.is_null() {
         None
     } else {
-        Some(str_from_ptr(ptr))
+        Some(lossy_str(ptr))
     }
+}
+
+/// The elements of a list librdkafka owns; an empty list may have no element
+/// array at all.
+unsafe fn list_elems<'a>(list: *const RDKafkaTopicPartitionList) -> &'a [RDKafkaTopicPartition] {
+    if list.is_null() {
+        return &[];
+    }
+    ptr_to_slice((*list).elems as *const c_void, (*list).cnt.max(0) as usize)
 }
 
 /// Copies a list librdkafka owns into a `TopicPartitionList` of our own.
@@ -378,26 +409,27 @@ unsafe fn copied_list(ptr: *const RDKafkaTopicPartitionList) -> TopicPartitionLi
 /// Logs a panic a callback caught. The payload is dropped and the logger is
 /// called under their own catch, so that neither can unwind across the
 /// `extern "C"` boundary.
-fn log_caught_panic(result: Result<(), Box<dyn std::any::Any + Send>>, message: &str) {
-    if let Err(payload) = result {
-        let again = panic::catch_unwind(AssertUnwindSafe(move || {
-            drop(payload);
-            error!("{}", message);
-        }));
-        if let Err(payload) = again {
-            // A payload whose drop panics is leaked rather than dropped here.
-            std::mem::forget(payload);
-        }
+fn log_caught_panic(payload: Box<dyn Any + Send>, message: &str) {
+    let again = panic::catch_unwind(AssertUnwindSafe(move || {
+        drop(payload);
+        error!("{}", message);
+    }));
+    if let Err(payload) = again {
+        // A payload whose drop panics is leaked rather than dropped here.
+        std::mem::forget(payload);
     }
 }
 
-/// Registers the context's assignor on the native configuration, with the
-/// context as the callbacks' opaque. The opaque must outlive the client.
+/// Registers the context's assignor, if it has one, on the native
+/// configuration, with the context as the callbacks' opaque; the `Arc` must
+/// outlive the client.
 pub(crate) fn register<C: ConsumerContext>(
     native_config: &NativeClientConfig,
-    assignor: &dyn PartitionAssignor,
-    opaque: *mut c_void,
+    context: &Arc<C>,
 ) -> KafkaResult<()> {
+    let Some(assignor) = context.assignor() else {
+        return Ok(());
+    };
     let name = CString::new(assignor.name())?;
     let protocol = match assignor.protocol() {
         AssignorProtocol::Eager => RDKafkaAssignorProtocol::RD_KAFKA_ASSIGNOR_PROTOCOL_EAGER,
@@ -413,7 +445,7 @@ pub(crate) fn register<C: ConsumerContext>(
             Some(subscription_cb::<C>),
             Some(assign_cb::<C>),
             Some(on_assignment_cb::<C>),
-            opaque,
+            Arc::as_ptr(context) as *mut c_void,
         )
     };
     Ok(())
@@ -438,14 +470,12 @@ unsafe extern "C" fn subscription_cb<C: ConsumerContext>(
     opaque: *mut c_void,
 ) {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let topics: Vec<&str> = if topic_cnt == 0 {
-            Vec::new()
-        } else {
-            slice::from_raw_parts(topics, topic_cnt)
+        let topics: Vec<Cow<'_, str>> =
+            ptr_to_slice::<*const c_char>(topics as *const c_void, topic_cnt)
                 .iter()
-                .map(|&t| str_from_ptr(t))
-                .collect()
-        };
+                .map(|&t| lossy_str(t))
+                .collect();
+        let topics: Vec<&str> = topics.iter().map(|t| &**t).collect();
         let owned = if owned_partitions.is_null() {
             None
         } else {
@@ -464,7 +494,7 @@ unsafe extern "C" fn subscription_cb<C: ConsumerContext>(
         }
         Ok(_) => {}
         Err(payload) => log_caught_panic(
-            Err(payload),
+            payload,
             "partition assignor panicked in subscription_userdata; sending none",
         ),
     }
@@ -490,9 +520,11 @@ unsafe extern "C" fn assign_cb<C: ConsumerContext>(
     // drops, including by panicking, completes it with an error.
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
         let metadata = ManuallyDrop::new(Metadata::from_ptr(metadata));
-        assignor_of::<C>(opaque).assign(str_from_ptr(member_id), &metadata, task);
+        assignor_of::<C>(opaque).assign(&lossy_str(member_id), &metadata, task);
     }));
-    log_caught_panic(result, "partition assignor panicked in assign");
+    if let Err(payload) = result {
+        log_caught_panic(payload, "partition assignor panicked in assign");
+    }
     RDKafkaAssignorResult::RD_KAFKA_ASSIGNOR_PENDING
 }
 
@@ -506,16 +538,14 @@ unsafe extern "C" fn on_assignment_cb<C: ConsumerContext>(
 ) {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let assignment = copied_list(assignment);
-        let userdata = if userdata.is_null() {
-            &[][..]
-        } else {
-            slice::from_raw_parts(userdata as *const u8, userdata_size)
-        };
+        let userdata = ptr_to_slice(userdata, userdata_size);
         let group = AssignedGroup::from_ptr(group_metadata);
         assignor_of::<C>(opaque).on_assignment(&assignment, userdata, &group);
     }));
-    log_caught_panic(
-        result,
-        "partition assignor panicked in on_assignment; the assignment stands",
-    );
+    if let Err(payload) = result {
+        log_caught_panic(
+            payload,
+            "partition assignor panicked in on_assignment; the assignment stands",
+        );
+    }
 }

@@ -91,13 +91,7 @@ where
         // The context is the assignor callbacks' opaque, so it is built here
         // and handed to the client, which drops the native handle before it.
         let context = Arc::new(context);
-        if let Some(assignor) = context.assignor() {
-            assignor::register::<C>(
-                &native_config,
-                assignor,
-                Arc::as_ptr(&context) as *mut c_void,
-            )?;
-        }
+        assignor::register(&native_config, &context)?;
         let client = Client::new_context_arc(
             config,
             native_config,

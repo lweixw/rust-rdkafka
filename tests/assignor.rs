@@ -1,5 +1,6 @@
 //! Test the application partition assignor against a broker.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -107,8 +108,8 @@ fn partitions_of(list: &TopicPartitionList) -> Vec<(String, i32)> {
     out
 }
 
-fn sorted(topics: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = topics.iter().map(|t| t.to_string()).collect();
+fn sorted<S: AsRef<str>>(topics: &[S]) -> Vec<String> {
+    let mut out: Vec<String> = topics.iter().map(|t| t.as_ref().to_owned()).collect();
     out.sort();
     out
 }
@@ -152,7 +153,7 @@ impl PartitionAssignor for RoundRobinAssignor {
 
         let n = task.member_count();
         let mut members: Vec<(String, usize)> = (0..n)
-            .map(|i| (task.member(i).id().to_owned(), i))
+            .map(|i| (task.member(i).id().into_owned(), i))
             .collect();
         members.sort();
 
@@ -176,8 +177,8 @@ impl PartitionAssignor for RoundRobinAssignor {
             }
             call.member_ids.push(id.clone());
             call.instance_ids
-                .push(member.group_instance_id().map(str::to_owned));
-            call.rack_ids.push(member.rack_id().map(str::to_owned));
+                .push(member.group_instance_id().map(Cow::into_owned));
+            call.rack_ids.push(member.rack_id().map(Cow::into_owned));
             call.subscriptions.push(sorted(&member.subscription()));
             call.owned.push(owned);
             call.userdata.push(member.userdata().to_vec());
@@ -386,6 +387,14 @@ fn expected_userdata(tag: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The rank of `id` in a leader call's sorted member list.
+fn rank_of(call: &AssignCall, id: &str) -> usize {
+    call.member_ids
+        .iter()
+        .position(|m| m == id)
+        .unwrap_or_else(|| panic!("{} not in {:?}", id, call.member_ids))
+}
+
 fn topics_only(calls: &[SubscriptionCall]) -> Vec<Vec<String>> {
     calls.iter().map(|c| c.topics.clone()).collect()
 }
@@ -424,13 +433,13 @@ const DROPPED: &str = "assignment task dropped without completing";
 /// without a broker.
 #[test]
 fn test_assignor_registration_is_validated() {
-    struct Named(&'static str);
+    struct Named(&'static str, AssignorProtocol);
     impl PartitionAssignor for Named {
         fn name(&self) -> &str {
             self.0
         }
         fn protocol(&self) -> AssignorProtocol {
-            AssignorProtocol::Eager
+            self.1
         }
         fn assign(&self, _: &str, _: &Metadata, task: AssignmentTask) {
             task.complete();
@@ -454,19 +463,19 @@ fn test_assignor_registration_is_validated() {
         .set("group.id", "validated")
         .set("bootstrap.servers", "localhost:1")
         .set("partition.assignment.strategy", "range");
-    let msg = creation_error(&config, Named("a,b"));
+    let msg = creation_error(&config, Named("a,b", AssignorProtocol::Eager));
     assert!(
         msg.contains("\"a,b\"") && msg.contains("commas"),
         "unexpected message: {}",
         msg
     );
 
-    let msg = creation_error(&config, Named(""));
+    let msg = creation_error(&config, Named("", AssignorProtocol::Eager));
     assert!(msg.contains("non-empty"), "unexpected message: {}", msg);
-    let msg = creation_error(&config, Named("a b"));
+    let msg = creation_error(&config, Named("a b", AssignorProtocol::Eager));
     assert!(msg.contains("whitespace"), "unexpected message: {}", msg);
 
-    let msg = creation_error(&config, Named("range"));
+    let msg = creation_error(&config, Named("range", AssignorProtocol::Eager));
     assert!(
         msg.contains("Failed to register application assignor \"range\"")
             && msg.contains("Conflicting"),
@@ -476,35 +485,19 @@ fn test_assignor_registration_is_validated() {
 
     // A registration the strategy names alongside a built-in of the other
     // protocol fails the strategy's protocol check.
-    struct Cooperative;
-    impl PartitionAssignor for Cooperative {
-        fn name(&self) -> &str {
-            "coop"
-        }
-        fn protocol(&self) -> AssignorProtocol {
-            AssignorProtocol::Cooperative
-        }
-        fn assign(&self, _: &str, _: &Metadata, task: AssignmentTask) {
-            task.complete();
-        }
-    }
     let mut mixed = config.clone();
     mixed.set("partition.assignment.strategy", "coop,range");
-    match mixed
-        .create_with_context::<_, BaseConsumer<_>>(AssignorContext::new(Arc::new(Cooperative)))
-    {
-        Err(KafkaError::ClientCreation(msg)) => assert!(
-            msg.contains("must have the same protocol type"),
-            "unexpected message: {}",
-            msg
-        ),
-        other => panic!("expected a creation error, got {:?}", other.map(|_| ())),
-    }
+    let msg = creation_error(&mixed, Named("coop", AssignorProtocol::Cooperative));
+    assert!(
+        msg.contains("must have the same protocol type"),
+        "unexpected message: {}",
+        msg
+    );
 
     config
         .set("session.timeout.ms", "6000")
         .set("heartbeat.interval.ms", "6000");
-    let msg = creation_error(&config, Named("ok"));
+    let msg = creation_error(&config, Named("ok", AssignorProtocol::Eager));
     assert!(
         msg.contains("must be less than session.timeout.ms (6000)"),
         "unexpected message: {}",
@@ -514,6 +507,7 @@ fn test_assignor_registration_is_validated() {
     // A name with a NUL cannot reach librdkafka at all.
     match config.create_with_context::<_, BaseConsumer<_>>(AssignorContext::new(Arc::new(Named(
         "nul\0name",
+        AssignorProtocol::Eager,
     )))) {
         Err(KafkaError::Nul(_)) => {}
         other => panic!("expected a Nul error, got {:?}", other.map(|_| ())),
@@ -594,16 +588,8 @@ async fn test_assignor_two_members_eager() {
     assert_eq!(alone.rack_ids, vec![None]);
     let both = calls1.last().unwrap();
     assert_eq!(both.member_ids.len(), 2, "last call: {:?}", both);
-    let rank1 = both
-        .member_ids
-        .iter()
-        .position(|m| *m == member_id1)
-        .unwrap();
-    let rank2 = both
-        .member_ids
-        .iter()
-        .position(|m| *m == member_id2)
-        .unwrap();
+    let rank1 = rank_of(both, &member_id1);
+    let rank2 = rank_of(both, &member_id2);
     assert_eq!(both.subscriptions[rank1], vec![topic.clone()]);
     assert_eq!(both.subscriptions[rank2], two_topics);
     assert_eq!(both.userdata[rank1], tag1);
@@ -743,36 +729,26 @@ async fn test_assignor_cooperative_handover() {
     assert!(calls1[..first_two].iter().all(|c| c.member_ids.len() == 1));
     let rounds = &calls1[first_two..];
     assert_eq!(rounds.len(), 3, "expected three rounds, saw {:?}", rounds);
-    let both = |call: &AssignCall| -> (usize, usize) {
-        (
-            call.member_ids
-                .iter()
-                .position(|m| *m == member_id1)
-                .unwrap(),
-            call.member_ids
-                .iter()
-                .position(|m| *m == member_id2)
-                .unwrap(),
-        )
-    };
     let owned_both = Some(vec![(topic.clone(), 0), (topic.clone(), 1)]);
     // Round 1: consumer1 owned both partitions when consumer2 joined; the
     // leader moved one in the same round and the library rejected the
     // assignment.
-    let (rank1, rank2) = both(&rounds[0]);
+    let rank1 = rank_of(&rounds[0], &member_id1);
+    let rank2 = rank_of(&rounds[0], &member_id2);
     assert_eq!(rounds[0].owned[rank1], owned_both);
     assert_eq!(rounds[0].owned[rank2], Some(Vec::new()));
     assert_eq!(rounds[0].userdata[rank1], b"eins-\xE2\x82\xAC");
     assert_eq!(rounds[0].userdata[rank2], b"");
     let violations = consumer1.context().log_lines_containing(VIOLATION);
     assert_eq!(violations.len(), 1, "log lines: {:?}", violations);
-    // Round 2: the same ownership, the moved partition now withheld.
-    assert_eq!(both(&rounds[1]), (rank1, rank2));
+    // Round 2: the same members, the same ownership, the moved partition now
+    // withheld.
+    assert_eq!(rounds[1].member_ids, rounds[0].member_ids);
     assert_eq!(rounds[1].owned[rank1], owned_both);
     assert_eq!(rounds[1].owned[rank2], Some(Vec::new()));
     assert_eq!(rounds[1].userdata[rank2], b"");
     // Round 3: the withheld partition had been revoked.
-    assert_eq!(both(&rounds[2]), (rank1, rank2));
+    assert_eq!(rounds[2].member_ids, rounds[0].member_ids);
     assert_eq!(
         rounds[2].owned[rank1],
         Some(vec![(topic.clone(), rank1 as i32)])
@@ -954,15 +930,19 @@ async fn test_assignor_failed_rounds_rejoin() {
     let given_up = context.log_lines_containing(GIVE_UP);
     assert_eq!(given_up.len(), 1, "log lines: {:?}", given_up);
 
-    // The held round's completion arrives after the group moved on: it is
-    // discarded, and nothing changes. (The group is stable by then, so this
-    // exercises the state check; the pending-id check is the C suite's.) A
+    // The held round's completion arrives after the library gave the round
+    // up: the give-up rejoin abandoned the pending handle, so the completion
+    // is dropped at the handle (the library's own checks for a completion
+    // that was already queued are the C suite's), and nothing changes. A
     // completion applied anyway would send a SyncGroup and run on_assignment
     // again, which the record count catches.
     let held = assignor.held.lock().unwrap().take().unwrap();
-    while !held.is_finished() {
-        consumer.poll(Duration::from_millis(100));
-    }
+    poll_until(
+        &[&consumer],
+        Duration::from_secs(30),
+        || held.is_finished(),
+        "the held completion",
+    );
     held.join().unwrap();
     let settle = Instant::now() + Duration::from_secs(2);
     while Instant::now() < settle {
@@ -973,11 +953,13 @@ async fn test_assignor_failed_rounds_rejoin() {
     assert_eq!(assignor.assignments.lock().unwrap().len(), 1);
 }
 
-/// A task completed, or dropped, after its consumer was dropped neither
-/// panics nor hangs the close: the pending handle outlives the client. (The
-/// memory safety of that path is the C suite's, under ASan.)
+/// A smoke test, not a counterfactual: a task completed, or dropped, after
+/// its consumer was dropped neither panics nor hangs the close, because the
+/// pending handle outlives the client. Nothing here would catch a completion
+/// that did nothing (those paths are `test_assignor_failed_rounds_rejoin`'s),
+/// and the memory safety of the C side is the C suite's, under ASan.
 #[tokio::test]
-async fn test_assignor_completion_after_consumer_dropped() {
+async fn test_assignor_completion_after_consumer_dropped_smoke() {
     init_test_logger();
 
     struct HoldingAssignor {
@@ -998,7 +980,7 @@ async fn test_assignor_completion_after_consumer_dropped() {
     let kafka_context = KafkaContext::shared()
         .await
         .expect("could not create kafka context");
-    let topic = rand_test_topic("test_assignor_completion_after_consumer_dropped");
+    let topic = rand_test_topic("test_assignor_completion_after_consumer_dropped_smoke");
     create_topic(&kafka_context, &topic, 1).await;
     let group = rand_test_group();
     let config = consumer_config(&kafka_context.bootstrap_servers, &group);
